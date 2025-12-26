@@ -1,0 +1,24 @@
+# Build artifacts
+/target
+
+# Output directories
+/frames
+/runs
+
+# Generated files
+*.mp4
+*.ppm
+generated.yaml
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+spec.md

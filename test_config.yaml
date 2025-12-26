@@ -1,0 +1,28 @@
+# Test configuration with dynamic energy sources
+grid:
+  width: 512
+  height: 256
+
+simulation:
+  seed: 123
+  mutation_rate: 4096
+  steps_per_run: 8192
+  max_epochs: 2000
+  neighbor_range: 2
+
+output:
+  frame_interval: 32
+  frames_dir: frames
+
+energy:
+  enabled: true
+  sources: 4
+  radius: 48
+  reserve_epochs: 5
+  death_epochs: 10
+  dynamic:
+    random_placement: true
+    max_sources: 6
+    source_lifetime: 400
+    spawn_rate: 80
+
