@@ -4,6 +4,7 @@
 # Output directories
 /frames
 /runs
+/checkpoints
 
 # Generated files
 *.mp4

@@ -160,23 +160,45 @@ echo ""
 echo ""
 echo "Generating videos..."
 
-# If using config dirs, extract frames_dir from config file
+# If using config dirs, extract base frames_dir from config file
 if [ -z "$FRAMES_DIR" ] && [ -n "$CONFIG_FILE" ]; then
-    FRAMES_DIR=$(grep -E "^\s*frames_dir:" "$CONFIG_FILE" | head -1 | sed 's/.*frames_dir:\s*["'\'']\?\([^"'\''#]*\)["'\'']\?.*/\1/' | xargs)
-    echo "  Using frames directory from config: $FRAMES_DIR"
+    BASE_FRAMES_DIR=$(grep -E "^\s*frames_dir:" "$CONFIG_FILE" | head -1 | sed 's/.*frames_dir:\s*["'\'']\?\([^"'\''#]*\)["'\'']\?.*/\1/' | xargs)
+    # The Rust program appends a timestamp, so find the most recently created matching directory
+    FRAMES_DIR=$(ls -dt "${BASE_FRAMES_DIR}"_* 2>/dev/null | head -1)
+    if [ -z "$FRAMES_DIR" ]; then
+        # Fallback to exact match if no timestamped version found
+        FRAMES_DIR="$BASE_FRAMES_DIR"
+    fi
+    echo "  Using frames directory: $FRAMES_DIR"
 fi
 
-VIDEO_DIR=$(dirname "$FRAMES_DIR" 2>/dev/null || echo ".")
-VIDEO_FILE="${VIDEO_DIR}/simulation_${RUN_ID}.mp4"
+# Save video inside the frames directory (alongside the frames)
+VIDEO_FILE="${FRAMES_DIR}/simulation.mp4"
 
-# Main simulation video (from sim 0 / root frames) - check for both png and ppm
-MAIN_FRAME_COUNT=$(find "$FRAMES_DIR" -maxdepth 1 \( -name "*.ppm" -o -name "*.png" \) 2>/dev/null | wc -l)
+# Copy the log file into the frames directory for complete run archive
+if [ -f "$LOG_FILE" ] && [ -d "$FRAMES_DIR" ]; then
+    cp "$LOG_FILE" "${FRAMES_DIR}/simulation.log"
+fi
+
+# Mega simulation video (combined multi-sim view) - check for mega_epoch_*.png
+MEGA_FRAME_COUNT=$(find "$FRAMES_DIR" -maxdepth 1 -name "mega_epoch_*.png" 2>/dev/null | wc -l)
+if [ "$MEGA_FRAME_COUNT" -gt 0 ]; then
+    MEGA_VIDEO="${FRAMES_DIR}/mega_simulation.mp4"
+    echo "  Mega: $MEGA_FRAME_COUNT frames -> $MEGA_VIDEO"
+    ffmpeg -y -framerate "$VIDEO_FPS" \
+        -pattern_type glob -i "${FRAMES_DIR}/mega_epoch_*.png" \
+        -c:v libx264 -pix_fmt yuv420p -crf 18 \
+        "$MEGA_VIDEO" 2>/dev/null
+fi
+
+# Main simulation video (from sim 0 / root frames) - check for numbered frames (not mega_)
+MAIN_FRAME_COUNT=$(find "$FRAMES_DIR" -maxdepth 1 \( -name "[0-9]*.ppm" -o -name "[0-9]*.png" \) 2>/dev/null | wc -l)
 if [ "$MAIN_FRAME_COUNT" -gt 0 ]; then
     # Detect format
-    if [ -f "${FRAMES_DIR}"/*.png 2>/dev/null ]; then
-        FRAME_PATTERN="${FRAMES_DIR}/*.png"
+    if ls "${FRAMES_DIR}"/[0-9]*.png 1>/dev/null 2>&1; then
+        FRAME_PATTERN="${FRAMES_DIR}/[0-9]*.png"
     else
-        FRAME_PATTERN="${FRAMES_DIR}/*.ppm"
+        FRAME_PATTERN="${FRAMES_DIR}/[0-9]*.ppm"
     fi
     echo "  Main: $MAIN_FRAME_COUNT frames -> $VIDEO_FILE"
     ffmpeg -y -framerate "$VIDEO_FPS" \
@@ -185,13 +207,13 @@ if [ "$MAIN_FRAME_COUNT" -gt 0 ]; then
         "$VIDEO_FILE" 2>/dev/null
 fi
 
-# Per-simulation videos (sim_0, sim_1, etc.)
+# Per-simulation videos (sim_0, sim_1, etc.) - saved inside frames directory
 for sim_dir in "$FRAMES_DIR"/sim_*; do
     if [ -d "$sim_dir" ]; then
         sim_name=$(basename "$sim_dir")
         sim_frames=$(find "$sim_dir" \( -name "*.ppm" -o -name "*.png" \) 2>/dev/null | wc -l)
         if [ "$sim_frames" -gt 0 ]; then
-            sim_video="${VIDEO_DIR}/${sim_name}_${RUN_ID}.mp4"
+            sim_video="${FRAMES_DIR}/${sim_name}.mp4"
             # Detect format
             if ls "${sim_dir}"/*.png 1>/dev/null 2>&1; then
                 SIM_PATTERN="${sim_dir}/*.png"
@@ -222,11 +244,17 @@ echo "Complete!"
 echo "=============================================="
 echo ""
 echo "Results:"
-echo "  Log: $LOG_FILE"
-[ -f "$VIDEO_FILE" ] && echo "  Video: $VIDEO_FILE ($(ls -lh "$VIDEO_FILE" | awk '{print $5}'))"
-for v in runs/${RUN_ID}_sim_*.mp4; do
-    [ -f "$v" ] && echo "  Video: $v ($(ls -lh "$v" | awk '{print $5}'))"
-done
-[ -d "$FRAMES_DIR" ] && echo "  Frames: $FRAMES_DIR/"
+if [ -d "$FRAMES_DIR" ]; then
+    echo "  Output directory: $FRAMES_DIR/"
+    echo "  Contains:"
+    [ -f "${FRAMES_DIR}/simulation.log" ] && echo "    - simulation.log"
+    [ -f "${FRAMES_DIR}/mega_simulation.mp4" ] && echo "    - mega_simulation.mp4 ($(ls -lh "${FRAMES_DIR}/mega_simulation.mp4" | awk '{print $5}'))"
+    [ -f "$VIDEO_FILE" ] && echo "    - simulation.mp4 ($(ls -lh "$VIDEO_FILE" | awk '{print $5}'))"
+    for v in "$FRAMES_DIR"/sim_*.mp4; do
+        [ -f "$v" ] && echo "    - $(basename "$v") ($(ls -lh "$v" | awk '{print $5}'))"
+    done
+    FRAME_COUNT=$(find "$FRAMES_DIR" -name "*.png" -o -name "*.ppm" 2>/dev/null | wc -l)
+    [ "$FRAME_COUNT" -gt 0 ] && echo "    - $FRAME_COUNT frame images"
+fi
 echo ""
 

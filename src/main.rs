@@ -603,7 +603,22 @@ fn print_help() {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
+    
+    // Generate unique run ID based on timestamp
+    let run_timestamp = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        format!("{}", duration.as_secs())
+    };
+    
+    // Append run ID to frames_dir to make it unique per run
+    // Format: frames_<timestamp> (e.g., frames_1735412345)
+    if !args.frames_dir.contains(&run_timestamp) {
+        args.frames_dir = format!("{}_{}", args.frames_dir, run_timestamp);
+    }
     
     // Handle --render-raw mode (render frames from raw data and exit)
     if let Some(ref raw_path) = args.render_raw_path {
