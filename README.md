@@ -328,11 +328,13 @@ Programs are paired and execute on a combined 128-byte tape (64 bytes from each 
 
 On an NVIDIA RTX 4090:
 
-| Configuration | Throughput |
-|--------------|------------|
-| Single simulation (1024x512) | ~166 billion ops/sec |
-| 8 parallel simulations | ~198 billion ops/sec |
-| 256 mega-simulation (16x16 layout) | ~1900 billion ops/sec |
+| Configuration | Throughput | Epochs/sec |
+|--------------|------------|------------|
+| Single simulation (1024x512) | ~166B ops/s | ~40 |
+| 8 parallel simulations (1024x512 each) | ~198B ops/s | ~6 |
+| 256 mega-simulation (16x16 of 256x256) | ~280B ops/s | ~4 |
+
+Note: Ops/sec measures total computation across all simulations. Larger configurations process more data per epoch, so epochs/sec decreases while total throughput increases.
 
 Raw data saving with async mode has minimal performance impact as saves occur in a background thread.
 

@@ -20,3 +20,4 @@ pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1.14", features = ["derive"], optional = true }
 png = "0.17"
 flate2 = "1.0"  # For fast zlib compression
+zstd = "0.13"   # For fast raw data compression

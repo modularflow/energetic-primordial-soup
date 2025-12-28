@@ -1052,12 +1052,28 @@ fn run_multi_gpu_simulation(
             }
         }
         
+        // Check if NEXT epoch needs saving - if so, start async readback after this epoch
+        let next_epoch_needs_save = frame_interval > 0 
+            && (save_raw || save_frames) 
+            && (epoch + 1) % frame_interval == 0 
+            && epoch + 1 < max_epochs;
+        
+        // Check if THIS epoch needs saving
+        let this_epoch_needs_save = frame_interval > 0 && epoch % frame_interval == 0;
+        
+        // Run epoch (always blocking for stable throughput)
         let ops = multi_sim.run_epoch_all();
         total_ops += ops;
         
+        // Start async readback for next epoch's save (copy happens while we do CPU work)
+        if next_epoch_needs_save && !multi_sim.has_pending_readback() {
+            multi_sim.begin_async_readback();
+        }
+        
         // Save checkpoint
-        if checkpoint_enabled && checkpoint_interval > 0 
-            && epoch > 0 && (epoch - last_checkpoint) >= checkpoint_interval {
+        let will_checkpoint = checkpoint_enabled && checkpoint_interval > 0 
+            && epoch > 0 && (epoch - last_checkpoint) >= checkpoint_interval;
+        if will_checkpoint {
             save_checkpoint(
                 multi_sim, epoch + 1, grid_width, grid_height, num_sims,
                 parallel_layout, effective_border_interaction, seed, checkpoint_path
@@ -1066,16 +1082,22 @@ fn run_multi_gpu_simulation(
         }
         
         // Save raw data and/or frames at intervals
-        if frame_interval > 0 && epoch % frame_interval == 0 {
-            // Save raw data (async or sync)
+        if this_epoch_needs_save {
+            // Get soup data - prefer async if available, otherwise sync
+            let all_soup = if multi_sim.has_pending_readback() {
+                // Use previously started async readback (should be ready now)
+                multi_sim.finish_async_readback().unwrap_or_else(|| multi_sim.get_all_soup())
+            } else {
+                // No async pending (first save), use sync
+                multi_sim.get_all_soup()
+            };
+            
+            // Save raw data (async or sync I/O)
             if save_raw {
-                // Get all soup data combined
-                let all_soup = multi_sim.get_all_soup();
-                
                 if let Some(ref writer) = async_writer {
                     // Async save - clone data and send to background thread
                     writer.save_raw(
-                        all_soup, epoch, raw_dir, 
+                        all_soup.clone(), epoch, raw_dir, 
                         grid_width, grid_height, num_sims, parallel_layout
                     );
                 } else {
@@ -1093,17 +1115,21 @@ fn run_multi_gpu_simulation(
             if save_frames {
                 // In mega-simulation mode, also save a combined frame
                 if effective_border_interaction {
-                    let _ = save_mega_frame(
-                        multi_sim, layout_cols, layout_rows, grid_width, grid_height,
-                        frames_dir, epoch, thumbnail_scale
+                    let _ = save_mega_frame_from_data(
+                        &all_soup, layout_cols, layout_rows, grid_width, grid_height,
+                        frames_dir, epoch, thumbnail_scale, num_sims
                     );
                 }
                 
+                // Extract per-sim data from combined soup
+                let sim_size = grid_width * grid_height * 64;
                 for sim_idx in 0..num_sims {
-                    let soup = multi_sim.get_soup(sim_idx);
+                    let start = sim_idx * sim_size;
+                    let end = start + sim_size;
+                    let soup = &all_soup[start..end];
                     let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
                     let _ = fs::create_dir_all(&sim_frames_dir);
-                    if let Err(e) = save_frame(&soup, grid_width, grid_height, &sim_frames_dir, epoch, frame_format, thumbnail_scale) {
+                    if let Err(e) = save_frame(soup, grid_width, grid_height, &sim_frames_dir, epoch, frame_format, thumbnail_scale) {
                         eprintln!("Warning: Could not save frame {} for sim {}: {}", epoch, sim_idx, e);
                     }
                 }
@@ -1638,6 +1664,112 @@ fn save_mega_frame(
     Ok(())
 }
 
+/// Save a combined mega-frame from pre-fetched soup data
+/// Used by async readback path to avoid re-fetching from GPU
+#[cfg(feature = "wgpu-compute")]
+fn save_mega_frame_from_data(
+    all_soup: &[u8],
+    layout_cols: usize,
+    layout_rows: usize,
+    grid_width: usize,
+    grid_height: usize,
+    frames_dir: &str,
+    epoch: usize,
+    scale: usize,
+    num_sims: usize,
+) -> std::io::Result<()> {
+    let _ = fs::create_dir_all(frames_dir);
+    
+    let scale = scale.max(1);
+    let sub_img_width = grid_width * 8;
+    let sub_img_height = grid_height * 8;
+    let full_width = sub_img_width * layout_cols;
+    let full_height = sub_img_height * layout_rows;
+    let sim_size = grid_width * grid_height * 64;
+    
+    // Output dimensions after scaling
+    let out_width = full_width / scale;
+    let out_height = full_height / scale;
+    
+    // For very large images, use even more aggressive scaling
+    let effective_scale = if out_width * out_height > 16_000_000 {
+        scale * 2
+    } else {
+        scale
+    };
+    let out_width = full_width / effective_scale;
+    let out_height = full_height / effective_scale;
+    
+    let mut mega_img = vec![0u8; out_width * out_height * 3];
+    let byte_colors = init_byte_colors();
+    
+    let scaled_sub_width = sub_img_width / effective_scale;
+    let scaled_sub_height = sub_img_height / effective_scale;
+    
+    for sim_row in 0..layout_rows {
+        for sim_col in 0..layout_cols {
+            let sim_idx = sim_row * layout_cols + sim_col;
+            if sim_idx >= num_sims {
+                continue;
+            }
+            
+            // Get this sim's soup from the combined data
+            let soup_start = sim_idx * sim_size;
+            let soup_end = soup_start + sim_size;
+            let soup = &all_soup[soup_start..soup_end];
+            
+            let offset_x = sim_col * scaled_sub_width;
+            let offset_y = sim_row * scaled_sub_height;
+            
+            for out_y in 0..scaled_sub_height {
+                for out_x in 0..scaled_sub_width {
+                    let src_x = out_x * effective_scale + effective_scale / 2;
+                    let src_y = out_y * effective_scale + effective_scale / 2;
+                    
+                    let prog_x = src_x / 8;
+                    let prog_y = src_y / 8;
+                    let byte_x = src_x % 8;
+                    let byte_y = src_y % 8;
+                    
+                    if prog_x < grid_width && prog_y < grid_height {
+                        let prog_idx = prog_y * grid_width + prog_x;
+                        let byte_idx = byte_y * 8 + byte_x;
+                        let byte_val = soup[prog_idx * 64 + byte_idx];
+                        let color = byte_colors[byte_val as usize];
+                        
+                        let pixel_x = offset_x + out_x;
+                        let pixel_y = offset_y + out_y;
+                        if pixel_x < out_width && pixel_y < out_height {
+                            let img_idx = (pixel_y * out_width + pixel_x) * 3;
+                            mega_img[img_idx] = color[0];
+                            mega_img[img_idx + 1] = color[1];
+                            mega_img[img_idx + 2] = color[2];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    use std::io::BufWriter;
+    let filename = format!("{}/mega_epoch_{:08}.png", frames_dir, epoch);
+    let file = File::create(&filename)?;
+    let w = BufWriter::new(file);
+    
+    let mut encoder = png::Encoder::new(w, out_width as u32, out_height as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Best);
+    encoder.set_filter(png::FilterType::Avg);
+    
+    let mut writer = encoder.write_header()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.write_image_data(&mega_img)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    
+    Ok(())
+}
+
 /// Format a Unix timestamp as a human-readable string
 fn chrono_time_str(timestamp: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
@@ -1885,7 +2017,7 @@ impl AsyncWriter {
     }
 }
 
-/// Save raw soup data to disk (synchronous version)
+/// Save raw soup data to disk (synchronous version) with Zstd compression
 fn save_raw_data_sync(
     data: &[u8],
     epoch: usize,
@@ -1898,16 +2030,16 @@ fn save_raw_data_sync(
     fs::create_dir_all(raw_dir)?;
     
     // File format: raw_epoch_NNNNNNNN.bin
-    // Header: 32 bytes (magic + metadata), then raw soup bytes
+    // Header: 36 bytes (magic + metadata + compressed_size), then zstd compressed soup
     let path = Path::new(raw_dir).join(format!("raw_epoch_{:08}.bin", epoch));
     let file = File::create(&path)?;
     let mut writer = BufWriter::new(file);
     
-    // Magic number: "BFFR" (BFF Raw)
-    writer.write_all(b"BFFR")?;
+    // Magic number: "BFF2" (BFF Raw v2 - compressed)
+    writer.write_all(b"BFF2")?;
     
     // Version (u32)
-    writer.write_all(&1u32.to_le_bytes())?;
+    writer.write_all(&2u32.to_le_bytes())?;
     
     // Metadata
     writer.write_all(&(epoch as u32).to_le_bytes())?;
@@ -1917,8 +2049,13 @@ fn save_raw_data_sync(
     writer.write_all(&(layout[0] as u32).to_le_bytes())?;
     writer.write_all(&(layout[1] as u32).to_le_bytes())?;
     
-    // Raw soup data
-    writer.write_all(data)?;
+    // Compress soup data with zstd level 1 (fast)
+    let compressed = zstd::encode_all(data, 1)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    
+    // Write compressed size and data
+    writer.write_all(&(compressed.len() as u32).to_le_bytes())?;
+    writer.write_all(&compressed)?;
     
     Ok(())
 }
@@ -1933,7 +2070,7 @@ struct RawDataHeader {
     layout: [usize; 2],
 }
 
-/// Load raw data file header
+/// Load raw data file header (supports both v1 BFFR and v2 BFF2 formats)
 fn load_raw_header(path: &Path) -> std::io::Result<RawDataHeader> {
     use std::io::Read;
     let mut file = File::open(path)?;
@@ -1941,7 +2078,7 @@ fn load_raw_header(path: &Path) -> std::io::Result<RawDataHeader> {
     // Read magic
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
-    if &magic != b"BFFR" {
+    if &magic != b"BFFR" && &magic != b"BFF2" {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid raw data magic"));
     }
     
@@ -1973,7 +2110,7 @@ fn load_raw_header(path: &Path) -> std::io::Result<RawDataHeader> {
     })
 }
 
-/// Load raw data file (header + soup data)
+/// Load raw data file (header + soup data) - supports both v1 BFFR and v2 BFF2 formats
 fn load_raw_data(path: &Path) -> std::io::Result<(RawDataHeader, Vec<u8>)> {
     use std::io::Read;
     let mut file = File::open(path)?;
@@ -1982,8 +2119,11 @@ fn load_raw_data(path: &Path) -> std::io::Result<(RawDataHeader, Vec<u8>)> {
     let mut header_buf = [0u8; 32];
     file.read_exact(&mut header_buf)?;
     
-    // Parse header
-    if &header_buf[0..4] != b"BFFR" {
+    // Parse magic and determine format
+    let magic = &header_buf[0..4];
+    let is_compressed = magic == b"BFF2";
+    
+    if magic != b"BFFR" && magic != b"BFF2" {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid raw data magic"));
     }
     
@@ -2002,9 +2142,24 @@ fn load_raw_data(path: &Path) -> std::io::Result<(RawDataHeader, Vec<u8>)> {
         layout: [layout_cols, layout_rows],
     };
     
-    // Read soup data
-    let mut soup_data = Vec::new();
-    file.read_to_end(&mut soup_data)?;
+    // Read soup data based on format
+    let soup_data = if is_compressed {
+        // BFF2: Read compressed size, then decompress
+        let mut size_buf = [0u8; 4];
+        file.read_exact(&mut size_buf)?;
+        let compressed_size = u32::from_le_bytes(size_buf) as usize;
+        
+        let mut compressed = vec![0u8; compressed_size];
+        file.read_exact(&mut compressed)?;
+        
+        zstd::decode_all(&compressed[..])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    } else {
+        // BFFR: Read uncompressed data
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        data
+    };
     
     Ok((header, soup_data))
 }

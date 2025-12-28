@@ -22,4 +22,5 @@ generated.yaml
 Thumbs.db
 
 spec.md
-.log
+optimization_spec.md
+*.log

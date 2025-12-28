@@ -624,6 +624,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         pos += 1;
         if (pos >= i32(FULL_TAPE_SIZE)) { break; }
     }
+    } else {
+        // Tape is empty/dead - skip interpreter, count all as skipped
+        nskip = params.steps_per_run;
+    }
     
     // Track if programs were dead at START of epoch (before any revival)
     let p1_was_dead = is_dead(p1_state);
@@ -782,12 +786,68 @@ struct EnergyParams {
 @group(0) @binding(3) var<storage, read_write> ops_count: atomic<u32>;
 @group(0) @binding(4) var<uniform> energy_params: EnergyParams;
 @group(0) @binding(5) var<storage, read_write> energy_state: array<u32>;
+@group(0) @binding(6) var<storage, read> energy_map: array<u32>;  // Pre-computed energy zone lookup (1 bit per program, packed)
 
 fn lcg(seed: u32) -> u32 {
     return seed * 1664525u + 1013904223u;
 }
 
-// Check if point is within source (with shape support)
+// Apply mutations using geometric skip (much faster for low mutation rates)
+// Instead of checking every byte, we skip directly to mutation positions
+// For mutation_prob = 1/4096, this is ~64x faster (0.016 mutations per 64 bytes on average)
+fn apply_mutations_sparse(
+    tape: ptr<function, array<u32, 32>>,
+    start_word: u32,
+    end_word: u32,
+    rng: ptr<function, u32>,
+    mutation_prob: u32
+) {
+    // Calculate inverse probability for skip calculation
+    // mutation_prob is out of 2^30, so inv ≈ 2^30 / mutation_prob
+    // For mutation_prob = 2^18, this is 4096
+    let inv_prob = (1u << 30u) / max(mutation_prob, 1u);
+    
+    // Start position in bytes
+    var byte_pos = start_word * 4u;
+    let end_byte = end_word * 4u;
+    
+    // Skip to first mutation position using geometric distribution
+    // skip ≈ U * inv_prob where U is uniform [0,1) gives us exponential distribution
+    *rng = lcg(*rng);
+    var skip = ((*rng >> 8u) * inv_prob) >> 22u;
+    byte_pos = byte_pos + skip;
+    
+    // Apply mutations at geometric intervals
+    loop {
+        if (byte_pos >= end_byte) { break; }
+        
+        // Apply mutation at this byte position
+        *rng = lcg(*rng);
+        let word_idx = byte_pos / 4u;
+        let byte_offset = (byte_pos % 4u) * 8u;
+        let new_byte = (*rng >> 8u) & 0xFFu;
+        let mask = ~(0xFFu << byte_offset);
+        (*tape)[word_idx] = ((*tape)[word_idx] & mask) | (new_byte << byte_offset);
+        
+        // Skip to next mutation position (geometric distribution)
+        // Add 1 to ensure we always advance at least 1 byte
+        *rng = lcg(*rng);
+        skip = max(1u, ((*rng >> 8u) * inv_prob) >> 22u);
+        byte_pos = byte_pos + skip;
+    }
+}
+
+// Fast energy zone lookup using pre-computed bitmask
+// Returns true if program is in an energy zone
+fn in_energy_zone_fast(global_prog_idx: u32) -> bool {
+    if (energy_params.enabled == 0u) { return true; }
+    // Each u32 holds 32 program flags
+    let word_idx = global_prog_idx / 32u;
+    let bit_idx = global_prog_idx % 32u;
+    return (energy_map[word_idx] & (1u << bit_idx)) != 0u;
+}
+
+// Check if point is within source (with shape support) - kept for fallback
 fn in_source_batched(x: i32, y: i32, sx: u32, sy: u32, shape: u32, radius: u32) -> bool {
     let dx = f32(x) - f32(i32(sx));
     let dy = f32(y) - f32(i32(sy));
@@ -834,6 +894,7 @@ fn source_offset_y(sim_idx: u32, src_idx: u32, base_y: u32) -> u32 {
     return u32((new_y + i32(grid_height)) % i32(grid_height));
 }
 
+// Energy zone check - original geometric calculations (faster than buffer lookup on GPU)
 fn in_energy_zone_sim(prog_idx: u32, sim_idx: u32) -> bool {
     if (energy_params.enabled == 0u) { return true; }
     let x = i32(prog_idx % params.grid_width);
@@ -871,14 +932,113 @@ fn can_mutate_sim(prog_idx: u32, sim_offset: u32, sim_idx: u32) -> bool {
     return in_energy_zone_sim(prog_idx, sim_idx) || get_reserve(state) > 0u;
 }
 
+// Fast version using pre-computed energy map bitmask - O(1) lookup
+fn can_mutate_fast(global_prog_idx: u32) -> bool {
+    if (energy_params.enabled == 0u) { return true; }
+    let state = energy_state[global_prog_idx];
+    if (is_dead(state)) { return false; }
+    return in_energy_zone_fast(global_prog_idx) || get_reserve(state) > 0u;
+}
+
+// === WORKGROUP SHARED MEMORY CACHE FOR ENERGY MAP ===
+// In normal batched mode, all 256 threads in a workgroup access the same simulation.
+// We pre-load energy_map words for that sim into shared memory for faster lookups.
+// 256 words = 8192 programs covered (enough for grids up to ~90x90 per sim).
+var<workgroup> energy_cache: array<u32, 256>;
+var<workgroup> cache_base_word: u32;  // Starting word index of cached region
+var<workgroup> cache_valid: u32;      // 1 if cache is populated
+
+// === COMMAND LOOKUP TABLE ===
+// Maps byte values (0-255) to operation codes (0-10) for faster dispatch.
+// Operation codes: 0=noop, 1=<, 2=>, 3={, 4=}, 5=+, 6=-, 7=., 8=,, 9=[, 10=]
+// Using 256 bytes packed into 64 u32s (4 bytes per word).
+var<workgroup> cmd_table: array<u32, 64>;
+
+// Lookup using shared cache (call only after cache is populated)
+fn in_energy_zone_cached(global_prog_idx: u32) -> bool {
+    if (energy_params.enabled == 0u) { return true; }
+    let word_idx = global_prog_idx / 32u;
+    let bit_idx = global_prog_idx % 32u;
+    
+    // Check if this word is in our cache
+    let cache_offset = word_idx - cache_base_word;
+    if (cache_offset < 256u) {
+        return (energy_cache[cache_offset] & (1u << bit_idx)) != 0u;
+    }
+    // Fallback to global memory for out-of-cache accesses
+    return (energy_map[word_idx] & (1u << bit_idx)) != 0u;
+}
+
+// Fast can_mutate using cached lookup
+fn can_mutate_cached(global_prog_idx: u32) -> bool {
+    if (energy_params.enabled == 0u) { return true; }
+    let state = energy_state[global_prog_idx];
+    if (is_dead(state)) { return false; }
+    return in_energy_zone_cached(global_prog_idx) || get_reserve(state) > 0u;
+}
+
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {
     let pair_idx = global_id.x;
     
     // In mega mode: pairs are absolute indices, dispatch y=1
     // In normal mode: pairs are local, dispatch y=num_sims
     var sim_idx = global_id.y;
     
+    // === POPULATE ENERGY MAP CACHE ===
+    // In normal batched mode, all threads in a workgroup access the same simulation.
+    // We cooperatively load energy_map words into shared memory for faster lookups.
+    // This must happen BEFORE any early returns to ensure all threads participate in barrier.
+    if (params.mega_mode == 0u && energy_params.enabled != 0u) {
+        // Calculate the base word index for this simulation's energy region
+        let words_per_sim = (params.num_programs + 31u) / 32u;
+        let sim_base_word = sim_idx * words_per_sim;
+        
+        // Thread 0 sets up the cache metadata
+        if (local_id.x == 0u) {
+            cache_base_word = sim_base_word;
+            cache_valid = 1u;
+        }
+        
+        // Each thread loads one word into the cache (if within range)
+        if (local_id.x < min(256u, words_per_sim)) {
+            energy_cache[local_id.x] = energy_map[sim_base_word + local_id.x];
+        }
+    }
+    
+    // === INITIALIZE COMMAND LOOKUP TABLE ===
+    // Each thread initializes 4 bytes (one word) of the 256-byte command table.
+    // Maps byte values to opcodes: 0=noop, 1=<, 2=>, 3={, 4=}, 5=+, 6=-, 7=., 8=,, 9=[, 10=]
+    // Only need 64 threads to fill 64 words (256 bytes).
+    if (local_id.x < 64u) {
+        let base_byte = local_id.x * 4u;
+        var packed: u32 = 0u;
+        for (var b = 0u; b < 4u; b++) {
+            let byte_val = base_byte + b;
+            var opcode: u32 = 0u;  // Default: noop
+            if (byte_val == 60u) { opcode = 1u; }       // '<'
+            else if (byte_val == 62u) { opcode = 2u; }  // '>'
+            else if (byte_val == 123u) { opcode = 3u; } // '{'
+            else if (byte_val == 125u) { opcode = 4u; } // '}'
+            else if (byte_val == 43u) { opcode = 5u; }  // '+'
+            else if (byte_val == 45u) { opcode = 6u; }  // '-'
+            else if (byte_val == 46u) { opcode = 7u; }  // '.'
+            else if (byte_val == 44u) { opcode = 8u; }  // ','
+            else if (byte_val == 91u) { opcode = 9u; }  // '['
+            else if (byte_val == 93u) { opcode = 10u; } // ']'
+            packed = packed | (opcode << (b * 8u));
+        }
+        cmd_table[local_id.x] = packed;
+    }
+    
+    // Synchronize - all threads must reach this point
+    workgroupBarrier();
+    
+    // Now we can do early returns after the barrier
     if (params.mega_mode == 0u) {
         // Normal batched mode
         if (pair_idx >= params.num_pairs || sim_idx >= params.num_sims) { return; }
@@ -918,17 +1078,41 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         sim_idx = p1_sim; // Use p1's sim for RNG
     }
     
-    // Energy offsets for each program's simulation
-    let p1_energy_offset = p1_sim * params.num_programs;
-    let p2_energy_offset = p2_sim * params.num_programs;
+    // Load energy states using absolute indices
+    // Use pre-computed energy map bitmask for O(1) zone lookups instead of expensive geometric math
+    var p1_state = energy_state[p1_abs];
+    var p2_state = energy_state[p2_abs];
     
-    // Load energy states (each sim has different energy zone positions)
-    var p1_state = energy_state[p1_energy_offset + p1_local];
-    var p2_state = energy_state[p2_energy_offset + p2_local];
-    let p1_in_zone = in_energy_zone_sim(p1_local, p1_sim);
-    let p2_in_zone = in_energy_zone_sim(p2_local, p2_sim);
-    let p1_can_mutate = can_mutate_sim(p1_local, p1_energy_offset, p1_sim);
-    let p2_can_mutate = can_mutate_sim(p2_local, p2_energy_offset, p2_sim);
+    // Use cached lookups in normal mode (cache populated above), fall back to global in mega mode
+    var p1_in_zone: bool;
+    var p2_in_zone: bool;
+    var p1_can_mutate: bool;
+    var p2_can_mutate: bool;
+    
+    if (params.mega_mode == 0u) {
+        // Normal mode: use shared memory cache for faster lookups
+        p1_in_zone = in_energy_zone_cached(p1_abs);
+        p2_in_zone = in_energy_zone_cached(p2_abs);
+        p1_can_mutate = can_mutate_cached(p1_abs);
+        p2_can_mutate = can_mutate_cached(p2_abs);
+    } else {
+        // Mega mode: programs may span sims, use global memory
+        p1_in_zone = in_energy_zone_fast(p1_abs);
+        p2_in_zone = in_energy_zone_fast(p2_abs);
+        p1_can_mutate = can_mutate_fast(p1_abs);
+        p2_can_mutate = can_mutate_fast(p2_abs);
+    }
+    
+    // === SKIP DEAD PAIRS OPTIMIZATION ===
+    // If both programs are dead and neither is in an energy zone (no revival possible),
+    // skip the entire tape load, mutation, and BFF evaluation.
+    // In late-stage sims with high mortality, this can skip 50-90% of pairs.
+    let p1_dead = is_dead(p1_state);
+    let p2_dead = is_dead(p2_state);
+    if (p1_dead && p2_dead && !p1_in_zone && !p2_in_zone) {
+        // Both dead, outside energy zones - nothing can happen, skip entirely
+        return;
+    }
     
     var p1_received_copy = false;
     var p2_received_copy = false;
@@ -945,33 +1129,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Use sim_idx to differentiate RNG per simulation
     var rng_state = params.seed_lo ^ params.epoch_lo ^ (pair_idx * 0x9E3779B9u) ^ (sim_idx * 0x85EBCA6Bu);
     
+    // Apply mutations using geometric skip (O(mutations) instead of O(bytes))
+    // For mutation_prob = 1/4096 and 64 bytes, we expect ~0.016 mutations on average
+    // This skips directly to mutation positions instead of checking every byte
     if (p1_can_mutate) {
-        for (var i = 0u; i < 16u; i++) {
-            rng_state = lcg(rng_state);
-            if ((rng_state & 0x3FFFFFFFu) < params.mutation_prob) {
-                rng_state = lcg(rng_state);
-                tape[i] = rng_state;
-            }
-        }
-    } else {
-        for (var i = 0u; i < 16u; i++) {
-            rng_state = lcg(rng_state);
-            if ((rng_state & 0x3FFFFFFFu) < params.mutation_prob) { rng_state = lcg(rng_state); }
-        }
+        apply_mutations_sparse(&tape, 0u, 16u, &rng_state, params.mutation_prob);
     }
     
     if (p2_can_mutate) {
-        for (var i = 16u; i < 32u; i++) {
-            rng_state = lcg(rng_state);
-            if ((rng_state & 0x3FFFFFFFu) < params.mutation_prob) {
-                rng_state = lcg(rng_state);
-                tape[i] = rng_state;
-            }
-        }
-    } else {
-        for (var i = 16u; i < 32u; i++) {
-            rng_state = lcg(rng_state);
-            if ((rng_state & 0x3FFFFFFFu) < params.mutation_prob) { rng_state = lcg(rng_state); }
+        apply_mutations_sparse(&tape, 16u, 32u, &rng_state, params.mutation_prob);
+    }
+    
+    // Early exit optimization: check if tape is empty (dead programs)
+    // Skip expensive interpreter loop for all-zero tapes
+    var tape_active = false;
+    for (var i = 0u; i < 32u; i++) {
+        if (tape[i] != 0u) { 
+            tape_active = true; 
+            break; 
         }
     }
     
@@ -981,6 +1156,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var head1: i32 = i32(((tape[0] >> 8u) & 0xFFu) % FULL_TAPE_SIZE);
     var nskip: u32 = 0u;
     
+    // Only run interpreter if tape has content
+    if (tape_active) {
     for (var step = 0u; step < params.steps_per_run; step++) {
         head0 = head0 & i32(FULL_TAPE_SIZE - 1u);
         head1 = head1 & i32(FULL_TAPE_SIZE - 1u);
@@ -988,12 +1165,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let cmd_byte_offset = (u32(pos) % 4u) * 8u;
         let cmd = (tape[cmd_word_idx] >> cmd_byte_offset) & 0xFFu;
         
-        switch (cmd) {
-            case 60u: { head0 -= 1; }
-            case 62u: { head0 += 1; }
-            case 123u: { head1 -= 1; }
-            case 125u: { head1 += 1; }
-            case 43u: {
+        // === COMMAND LOOKUP TABLE ===
+        // Look up opcode from shared memory table instead of switching on 256 byte values.
+        // Reduces branch divergence by mapping to smaller opcode range (0-10).
+        let table_word = cmd / 4u;
+        let table_byte = (cmd % 4u) * 8u;
+        let opcode = (cmd_table[table_word] >> table_byte) & 0xFFu;
+        
+        // Switch on opcode (0-10) instead of byte value (0-255)
+        // 0=noop, 1=<, 2=>, 3={, 4=}, 5=+, 6=-, 7=., 8=,, 9=[, 10=]
+        switch (opcode) {
+            case 0u: { nskip += 1u; }  // no-op
+            case 1u: { head0 -= 1; }   // '<'
+            case 2u: { head0 += 1; }   // '>'
+            case 3u: { head1 -= 1; }   // '{'
+            case 4u: { head1 += 1; }   // '}'
+            case 5u: {  // '+' increment
                 let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let word_idx = idx / 4u;
                 let byte_off = (idx % 4u) * 8u;
@@ -1001,7 +1188,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let mask = ~(0xFFu << byte_off);
                 tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
             }
-            case 45u: {
+            case 6u: {  // '-' decrement
                 let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let word_idx = idx / 4u;
                 let byte_off = (idx % 4u) * 8u;
@@ -1009,7 +1196,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let mask = ~(0xFFu << byte_off);
                 tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
             }
-            case 46u: {
+            case 7u: {  // '.' copy head0 -> head1
                 let src_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let dst_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
                 let src_word = src_idx / 4u;
@@ -1025,7 +1212,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
                 }
             }
-            case 44u: {
+            case 8u: {  // ',' copy head1 -> head0
                 let src_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
                 let dst_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let src_word = src_idx / 4u;
@@ -1041,7 +1228,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
                 }
             }
-            case 91u: {
+            case 9u: {  // '[' loop start
                 let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let h_word = h_idx / 4u;
                 let h_off = (h_idx % 4u) * 8u;
@@ -1061,7 +1248,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     if (depth != 0) { pos = i32(FULL_TAPE_SIZE); }
                 }
             }
-            case 93u: {
+            case 10u: {  // ']' loop end
                 let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
                 let h_word = h_idx / 4u;
                 let h_off = (h_idx % 4u) * 8u;
@@ -1086,6 +1273,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (pos < 0) { break; }
         pos += 1;
         if (pos >= i32(FULL_TAPE_SIZE)) { break; }
+    }
+    } else {
+        // Tape is empty/dead - skip interpreter, count all as skipped
+        nskip = params.steps_per_run;
     }
     
     // Track if programs were dead at START of epoch
@@ -1116,7 +1307,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
         p1_stays_dead = p1_was_dead && p1_dead;
-        energy_state[p1_energy_offset + p1_local] = pack_state(p1_reserve, p1_timer, p1_dead);
+        energy_state[p1_abs] = pack_state(p1_reserve, p1_timer, p1_dead);
         
         var p2_reserve = get_reserve(p2_state);
         var p2_timer = get_timer(p2_state);
@@ -1137,13 +1328,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
         p2_stays_dead = p2_was_dead && p2_dead;
-        energy_state[p2_energy_offset + p2_local] = pack_state(p2_reserve, p2_timer, p2_dead);
+        energy_state[p2_abs] = pack_state(p2_reserve, p2_timer, p2_dead);
     }
     
     // Write back soup - dead tapes stay zeroed
     if (p1_stays_dead) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
-    } else if (is_dead(energy_state[p1_energy_offset + p1_local])) {
+    } else if (is_dead(energy_state[p1_abs])) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = tape[i]; }
@@ -1151,7 +1342,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     if (p2_stays_dead) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
-    } else if (is_dead(energy_state[p2_energy_offset + p2_local])) {
+    } else if (is_dead(energy_state[p2_abs])) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = tape[i + 16u]; }
@@ -1714,11 +1905,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Concatenated buffers (all sims in one buffer)
         soup_buffer: wgpu::Buffer,        // size = num_programs * 64 * num_sims
         energy_state_buffer: wgpu::Buffer, // size = num_programs * 4 * num_sims
+        energy_map_buffer: wgpu::Buffer,  // Pre-computed energy zone bitmask (packed bits)
         pairs_buffer: wgpu::Buffer,
         params_buffer: wgpu::Buffer,
         ops_buffer: wgpu::Buffer,
         energy_params_buffer: wgpu::Buffer,
-        staging_buffer: wgpu::Buffer,
+        staging_buffer: wgpu::Buffer,     // Single-sim staging (legacy)
+        // Ping-pong staging for async readback
+        staging_soup_a: wgpu::Buffer,     // Full soup staging buffer A
+        staging_soup_b: wgpu::Buffer,     // Full soup staging buffer B
+        staging_current: bool,            // true = A is being written, B is ready to read
+        pending_readback: bool,           // true = there's pending data to read
         bind_group: wgpu::BindGroup,
         // Config
         num_sims: usize,
@@ -1866,9 +2063,35 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 mapped_at_creation: false,
             });
 
+            // Energy map buffer: 1 bit per program across all sims, packed into u32s
+            // Size = ceil(num_programs * num_sims / 32) * 4 bytes
+            let total_programs = num_programs * num_sims;
+            let energy_map_words = (total_programs + 31) / 32;
+            let energy_map_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("EnergyMap"),
+                size: (energy_map_words * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
             let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Staging"),
                 size: soup_size_per_sim,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            // Ping-pong staging buffers for async readback (full soup size)
+            let staging_soup_a = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Staging Soup A"),
+                size: total_soup_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            let staging_soup_b = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Staging Soup B"),
+                size: total_soup_size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -1936,6 +2159,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -1963,10 +2196,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     wgpu::BindGroupEntry { binding: 3, resource: ops_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: energy_params_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: energy_state_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: energy_map_buffer.as_entire_binding() },
                 ],
             });
 
             queue.write_buffer(&energy_params_buffer, 0, bytemuck::bytes_of(&energy_params));
+
+            // Compute and upload initial energy map
+            let energy_map_data = Self::compute_energy_map_static(
+                &energy_params, num_programs, num_sims, grid_width, grid_height
+            );
+            queue.write_buffer(&energy_map_buffer, 0, bytemuck::cast_slice(&energy_map_data));
 
             Some(Self {
                 device,
@@ -1974,11 +2214,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 pipeline,
                 soup_buffer,
                 energy_state_buffer,
+                energy_map_buffer,
                 pairs_buffer,
                 params_buffer,
                 ops_buffer,
                 energy_params_buffer,
                 staging_buffer,
+                staging_soup_a,
+                staging_soup_b,
+                staging_current: false, // Start with writing to A
+                pending_readback: false,
                 bind_group,
                 num_sims,
                 num_programs,
@@ -2088,10 +2333,191 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             (self.num_pairs * self.steps_per_run as usize * ops_multiplier) as u64
         }
 
+        /// Run one epoch without waiting for completion (non-blocking)
+        /// Use sync() before reading data back
+        pub fn run_epoch_all_async(&mut self) -> u64 {
+            let (dispatch_x, dispatch_y) = if self.mega_mode {
+                (((self.num_pairs + 255) / 256) as u32, 1u32)
+            } else {
+                (((self.num_pairs + 255) / 256) as u32, self.num_sims as u32)
+            };
+            
+            let params = BatchedParams {
+                num_pairs: self.num_pairs as u32,
+                steps_per_run: self.steps_per_run,
+                mutation_prob: self.mutation_prob,
+                grid_width: self.grid_width as u32,
+                seed_lo: self.base_seed as u32,
+                seed_hi: (self.base_seed >> 32) as u32,
+                epoch_lo: self.epoch as u32,
+                epoch_hi: (self.epoch >> 32) as u32,
+                num_programs: self.num_programs as u32,
+                num_sims: self.num_sims as u32,
+                mega_mode: if self.mega_mode { 1 } else { 0 },
+                _pad1: 0,
+            };
+            self.queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+            
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("BFF Batched Compute Async"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("BFF Batched Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+            }
+
+            self.queue.submit(Some(encoder.finish()));
+            // Non-blocking poll - just check if there's work to do
+            self.device.poll(wgpu::Maintain::Poll);
+
+            self.epoch += 1;
+            
+            let ops_multiplier = if self.mega_mode { 1 } else { self.num_sims };
+            (self.num_pairs * self.steps_per_run as usize * ops_multiplier) as u64
+        }
+
+        /// Wait for all pending GPU work to complete
+        pub fn sync(&self) {
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
+        /// Compute energy zone bitmask on CPU
+        /// Returns packed u32s where bit i indicates if program i is in an energy zone
+        fn compute_energy_map_static(
+            energy_params: &EnergyParams,
+            num_programs: usize,
+            num_sims: usize,
+            grid_width: usize,
+            grid_height: usize,
+        ) -> Vec<u32> {
+            let total_programs = num_programs * num_sims;
+            let num_words = (total_programs + 31) / 32;
+            let mut map = vec![0u32; num_words];
+
+            // If energy not enabled, all programs are "in zone" (can always mutate)
+            if energy_params.enabled == 0 {
+                for word in &mut map {
+                    *word = 0xFFFFFFFF;
+                }
+                return map;
+            }
+
+            let sources = [
+                (energy_params.src0_x, energy_params.src0_y, energy_params.src0_shape, energy_params.src0_radius),
+                (energy_params.src1_x, energy_params.src1_y, energy_params.src1_shape, energy_params.src1_radius),
+                (energy_params.src2_x, energy_params.src2_y, energy_params.src2_shape, energy_params.src2_radius),
+                (energy_params.src3_x, energy_params.src3_y, energy_params.src3_shape, energy_params.src3_radius),
+                (energy_params.src4_x, energy_params.src4_y, energy_params.src4_shape, energy_params.src4_radius),
+                (energy_params.src5_x, energy_params.src5_y, energy_params.src5_shape, energy_params.src5_radius),
+                (energy_params.src6_x, energy_params.src6_y, energy_params.src6_shape, energy_params.src6_radius),
+                (energy_params.src7_x, energy_params.src7_y, energy_params.src7_shape, energy_params.src7_radius),
+            ];
+
+            for sim_idx in 0..num_sims {
+                for prog_idx in 0..num_programs {
+                    let x = (prog_idx % grid_width) as i32;
+                    let y = (prog_idx / grid_width) as i32;
+                    
+                    let mut in_zone = false;
+                    for src_idx in 0..energy_params.num_sources as usize {
+                        let (base_x, base_y, shape, radius) = sources[src_idx];
+                        
+                        // Compute per-sim offset (matches shader logic)
+                        let offset_x = Self::source_offset_x_cpu(sim_idx as u32, src_idx as u32, base_x, grid_width as u32);
+                        let offset_y = Self::source_offset_y_cpu(sim_idx as u32, src_idx as u32, base_y, grid_width as u32, grid_height as u32);
+                        
+                        if Self::in_source_cpu(x, y, offset_x, offset_y, shape, radius) {
+                            in_zone = true;
+                            break;
+                        }
+                    }
+                    
+                    if in_zone {
+                        let global_idx = sim_idx * num_programs + prog_idx;
+                        let word_idx = global_idx / 32;
+                        let bit_idx = global_idx % 32;
+                        map[word_idx] |= 1u32 << bit_idx;
+                    }
+                }
+            }
+            
+            map
+        }
+
+        /// Hash function matching shader
+        fn sim_hash_cpu(sim_idx: u32, src_idx: u32) -> u32 {
+            let mut h = sim_idx.wrapping_mul(0x9E3779B9).wrapping_add(src_idx.wrapping_mul(0x85EBCA6B));
+            h = h ^ (h >> 16);
+            h = h.wrapping_mul(0x21F0AAAD);
+            h = h ^ (h >> 15);
+            h
+        }
+
+        fn source_offset_x_cpu(sim_idx: u32, src_idx: u32, base_x: u32, grid_width: u32) -> u32 {
+            let h = Self::sim_hash_cpu(sim_idx, src_idx * 2);
+            let offset = (h % grid_width) as i32 - (grid_width / 2) as i32;
+            let new_x = base_x as i32 + offset;
+            ((new_x + grid_width as i32) % grid_width as i32) as u32
+        }
+
+        fn source_offset_y_cpu(sim_idx: u32, src_idx: u32, base_y: u32, _grid_width: u32, grid_height: u32) -> u32 {
+            let h = Self::sim_hash_cpu(sim_idx, src_idx * 2 + 1);
+            let offset = (h % grid_height) as i32 - (grid_height / 2) as i32;
+            let new_y = base_y as i32 + offset;
+            ((new_y + grid_height as i32) % grid_height as i32) as u32
+        }
+
+        fn in_source_cpu(x: i32, y: i32, sx: u32, sy: u32, shape: u32, radius: u32) -> bool {
+            let dx = x as f32 - sx as f32;
+            let dy = y as f32 - sy as f32;
+            let r = radius as f32;
+            let r_sq = r * r;
+            let dist_sq = dx * dx + dy * dy;
+
+            match shape {
+                0 => dist_sq <= r_sq,                           // Circle
+                1 => dx.abs() <= r && dy.abs() <= r / 4.0,     // Horizontal bar
+                2 => dx.abs() <= r / 4.0 && dy.abs() <= r,     // Vertical bar
+                3 => dy <= 0.0 && dist_sq <= r_sq,             // Upper semicircle
+                4 => dy >= 0.0 && dist_sq <= r_sq,             // Lower semicircle
+                5 => dx <= 0.0 && dist_sq <= r_sq,             // Left semicircle
+                6 => dx >= 0.0 && dist_sq <= r_sq,             // Right semicircle
+                7 => {
+                    let norm = (dx / r).powi(2) + (dy / (r / 2.0)).powi(2);
+                    norm <= 1.0
+                }                                               // Horizontal ellipse
+                8 => {
+                    let norm = (dx / (r / 2.0)).powi(2) + (dy / r).powi(2);
+                    norm <= 1.0
+                }                                               // Vertical ellipse
+                _ => dist_sq <= r_sq,
+            }
+        }
+
+        /// Update energy map on GPU
+        fn update_energy_map(&self) {
+            let map = Self::compute_energy_map_static(
+                &self.energy_params,
+                self.num_programs,
+                self.num_sims,
+                self.grid_width,
+                self.grid_height,
+            );
+            self.queue.write_buffer(&self.energy_map_buffer, 0, bytemuck::cast_slice(&map));
+        }
+
         /// Update energy config
         pub fn update_energy_config_all(&mut self, config: &crate::energy::EnergyConfig) {
-            self.energy_params = EnergyParams::from_config(config, self.grid_width, self.grid_width);
+            self.energy_params = EnergyParams::from_config(config, self.grid_width, self.grid_height);
             self.queue.write_buffer(&self.energy_params_buffer, 0, bytemuck::bytes_of(&self.energy_params));
+            // Also update energy map bitmask
+            self.update_energy_map();
         }
 
         /// Get soup data from a specific simulation
@@ -2157,6 +2583,75 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             drop(data);
             staging.unmap();
             result
+        }
+
+        /// Begin async readback - copies soup to staging buffer, returns immediately
+        /// Call finish_async_readback() to get the data
+        pub fn begin_async_readback(&mut self) {
+            let total_size = (self.num_programs * 64 * self.num_sims) as u64;
+            
+            // Choose which staging buffer to write to
+            let staging = if self.staging_current {
+                &self.staging_soup_b
+            } else {
+                &self.staging_soup_a
+            };
+            
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(&self.soup_buffer, 0, staging, 0, total_size);
+            self.queue.submit(Some(encoder.finish()));
+            
+            // Start the map operation (non-blocking)
+            let slice = staging.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_result| {
+                // Callback - we'll check result in finish_async_readback
+            });
+            
+            // Swap buffers for next time
+            self.staging_current = !self.staging_current;
+            self.pending_readback = true;
+        }
+
+        /// Check if there's pending readback data
+        pub fn has_pending_readback(&self) -> bool {
+            self.pending_readback
+        }
+
+        /// Finish async readback - polls until ready and returns data
+        /// Returns None if no readback was started
+        pub fn finish_async_readback(&mut self) -> Option<Vec<u8>> {
+            if !self.pending_readback {
+                return None;
+            }
+
+            // The "other" buffer (not the one currently being written to) has our data
+            let staging = if self.staging_current {
+                &self.staging_soup_a  // current=true means we just wrote to B, so A has data
+            } else {
+                &self.staging_soup_b  // current=false means we just wrote to A, so B has data
+            };
+
+            // Poll until ready
+            self.device.poll(wgpu::Maintain::Wait);
+
+            let slice = staging.slice(..);
+            let data = slice.get_mapped_range();
+            let result = data.to_vec();
+            drop(data);
+            staging.unmap();
+
+            self.pending_readback = false;
+            Some(result)
+        }
+
+        /// Get all soup data using async pattern if readback is pending,
+        /// otherwise use synchronous path. More convenient API.
+        pub fn get_all_soup_async(&mut self) -> Vec<u8> {
+            if self.pending_readback {
+                self.finish_async_readback().unwrap_or_else(|| self.get_all_soup())
+            } else {
+                self.get_all_soup()
+            }
         }
 
         /// Get all energy states from all simulations (for checkpointing)
