@@ -53,8 +53,8 @@ energy:
   sources: 6             # Initial number of sources (1-8)
                           # 4=corners, 5=+center, 6=+edges, 8=all
   radius: 64              # Radius of each energy source
-  reserve_epochs: 50       # Energy reserve when leaving zone
-  death_epochs: 100        # Epochs without interaction until death
+  reserve_epochs: 200       # Energy reserve when leaving zone (max 255)
+  death_epochs: 250         # Epochs without interaction until death (max 255)
   spontaneous_rate: 10     # 1 in N chance for dead tape in energy zone to spawn new random program (0 = disabled)
   shape: "random"         # Shape of energy zones: "circle", "strip_h", "strip_v", 
                           # "half_circle", "half_circle_bottom", "half_circle_left", "half_circle_right",

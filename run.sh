@@ -257,4 +257,3 @@ if [ -d "$FRAMES_DIR" ]; then
     [ "$FRAME_COUNT" -gt 0 ] && echo "    - $FRAME_COUNT frame images"
 fi
 echo ""
-
