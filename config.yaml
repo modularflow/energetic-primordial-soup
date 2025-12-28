@@ -29,13 +29,13 @@ simulation:
 #       Set USE_CONFIG_DIRS=true ./run.sh to use these paths instead.
 output:
   frame_interval: 128      # Save frame every N epochs (0 = disabled)
-  frames_dir: "/media/rob/extra_data/frames"     # Output directory for frames (relative or absolute path)
+  frames_dir: "frames"     # Output directory for frames (relative or absolute path)
   frame_format: "jpeg"      # "png" (compressed, ~10x smaller) or "ppm" (uncompressed, fast)
   thumbnail_scale: 4       # Downscale factor for regular frames (1 = full size, 4 = 1/4 size)
   
   # Raw data saving (for post-simulation rendering)
   save_raw: true           # Save raw soup data (fast binary, no rendering)
-  raw_dir: "/media/rob/extra_data/raw_data"  # Directory for raw data files
+  raw_dir: "raw_data"  # Directory for raw data files
   async_save: true         # Save in background thread (non-blocking)
   render_frames: false     # Also render frames during simulation (if false, only save raw)
 
@@ -43,7 +43,7 @@ output:
 checkpoint:
   enabled: true             # Enable checkpointing
   interval: 10000           # Save checkpoint every N epochs (0 = only at end)
-  path: "/media/rob/extra_data/checkpoints"       # Directory for checkpoint files (relative or absolute)
+  path: "checkpoints"       # Directory for checkpoint files (relative or absolute)
   resume_from: ""           # Path to checkpoint file to resume from (empty = start fresh)
 
 # Energy System
