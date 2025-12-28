@@ -54,7 +54,7 @@ This Rust implementation provides:
 ## Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/modularflow/energetic-primordial-soup.git
 cd energetic-primordial-soup
 cargo build --release --features wgpu-compute
 ```
