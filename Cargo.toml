@@ -18,3 +18,5 @@ cudarc = { version = "0.12", optional = true }
 wgpu = { version = "0.20", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1.14", features = ["derive"], optional = true }
+png = "0.17"
+flate2 = "1.0"  # For fast zlib compression

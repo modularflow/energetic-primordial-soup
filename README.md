@@ -37,7 +37,11 @@ The "energy" portion of this implementation is also inspired by research done on
 This Rust implementation provides:
 - GPU acceleration via wgpu (Vulkan/Metal backend for accessibility of all GPU brands)
 - Batched parallel simulations (run multiple seeds simultaneously)
-- Configurable energy zones for spatial evolutionary dynamics
+- Mega-simulation mode (parallel sims arranged in a grid with cross-border interaction)
+- Configurable energy zones with variable shapes for spatial evolutionary dynamics
+- Checkpointing for saving and resuming simulations
+- Async raw data saving for maximum simulation speed
+- Post-simulation frame rendering
 - YAML configuration files
 - Video generation from simulation frames
 
@@ -68,6 +72,9 @@ cargo build --release --features wgpu-compute
 
 # Override parameters via environment variables
 MAX_EPOCHS=5000 ./run.sh
+
+# Use paths from config.yaml instead of run.sh defaults
+USE_CONFIG_DIRS=true ./run.sh
 ```
 
 ### Using the binary directly
@@ -94,69 +101,215 @@ MAX_EPOCHS=5000 ./run.sh
 Create a `config.yaml` file to configure the simulation:
 
 ```yaml
+# Grid dimensions
 grid:
-  width: 1024
-  height: 512
+  width: 256
+  height: 256
 
+# Core simulation parameters
 simulation:
-  seed: 42
-  mutation_rate: 4096      # 1 in N chance per byte
-  steps_per_run: 8192      # BFF execution steps per epoch
-  max_epochs: 50000
-  neighbor_range: 2        # Pairing range (2 = 5x5 neighborhood)
-  parallel_sims: 8         # Run N simulations in parallel on GPU
+  seed: 42                      # Random seed for reproducibility
+  mutation_rate: 4096           # 1 in N chance per byte (higher = less mutation)
+  steps_per_run: 8192           # BFF execution steps per epoch
+  max_epochs: 100000            # Total epochs to run
+  neighbor_range: 2             # Pairing range (2 = 5x5 neighborhood)
+  auto_terminate_dead_epochs: 0 # Terminate if all dead for N epochs (0=disabled)
+  parallel_sims: 256            # Run N simulations in parallel on GPU
+  parallel_layout: [16, 16]     # Arrange as [cols, rows] grid for mega-simulation
+  border_interaction: true      # Enable cross-simulation pairing at borders
 
+# Output settings
 output:
-  frame_interval: 256      # Save frame every N epochs (0 = disabled)
-  frames_dir: "frames"
+  frame_interval: 128           # Save every N epochs (0 = disabled)
+  frames_dir: "frames"          # Output directory (relative or absolute)
+  frame_format: "png"           # "png", "jpeg", or "ppm"
+  thumbnail_scale: 4            # Downscale factor (1 = full, 4 = 1/4 size)
+  
+  # Raw data saving (for post-simulation rendering)
+  save_raw: true                # Save raw soup data (fast binary dumps)
+  raw_dir: "raw_data"           # Directory for raw data files
+  async_save: true              # Save in background thread (non-blocking)
+  render_frames: false          # Render frames during simulation
 
+# Checkpoint settings
+checkpoint:
+  enabled: true                 # Enable checkpointing
+  interval: 10000               # Save every N epochs (0 = only at end)
+  path: "checkpoints"           # Directory for checkpoint files
+  resume_from: ""               # Path to checkpoint to resume (empty = fresh start)
+
+# Energy system
 energy:
   enabled: true
-  sources: 8               # Number of energy sources (1-8)
-  radius: 128              # Radius of each source in grid cells
-  reserve_epochs: 50       # Reserve energy when leaving zone
-  death_epochs: 100        # Epochs without interaction until death
+  sources: 6                    # Number of sources (1-8)
+  radius: 64                    # Radius of each source
+  reserve_epochs: 50            # Reserve energy when leaving zone
+  death_epochs: 100             # Epochs without interaction until death
+  spontaneous_rate: 10          # 1 in N chance for dead tape in zone to respawn (0=disabled)
+  shape: "random"               # Shape: circle, strip_h, strip_v, half_circle,
+                                # half_circle_bottom, half_circle_left, half_circle_right,
+                                # ellipse, ellipse_v, random
+  
+  # Dynamic energy settings
   dynamic:
-    random_placement: true
-    max_sources: 20
-    source_lifetime: 10000  # Epochs until source expires (0 = infinite)
-    spawn_rate: 5000        # Spawn new source every N epochs (0 = disabled)
+    random_placement: true      # Randomize source positions
+    max_sources: 10             # Maximum simultaneous sources
+    source_lifetime: 10000      # Epochs until source expires (0 = infinite)
+    spawn_rate: 5000            # Spawn new source every N epochs (0 = disabled)
 ```
 
 ## Energy System
 
 The energy system adds spatial structure to the simulation:
 
-- **Energy Sources**: Fixed or randomly placed zones on the grid
+- **Energy Sources**: Fixed or randomly placed zones on the grid with configurable shapes
 - **Mutation Permission**: Only programs within energy zones (or with reserve energy) can mutate
 - **Reserve Energy**: Programs leaving an energy zone retain mutation ability for a limited time
 - **Death Timer**: Programs outside energy zones that don't interact for too long become inactive
 - **Dynamic Sources**: Sources can spawn, expire, and move over time
+- **Spontaneous Generation**: Dead tapes within energy zones can randomly spawn new programs
+- **Per-Simulation Variation**: Each parallel simulation gets unique energy field positions
 
-This creates evolutionary pressure where programs must either stay near energy sources or develop behaviors that allow them to survive and propagate outside the zones.
+### Energy Zone Shapes
 
-## Parallel Simulations
+Available shapes for energy zones:
+- `circle` - Standard circular zone
+- `strip_h` - Horizontal strip
+- `strip_v` - Vertical strip
+- `half_circle` - Top half of a circle
+- `half_circle_bottom` - Bottom half of a circle
+- `half_circle_left` - Left half of a circle
+- `half_circle_right` - Right half of a circle
+- `ellipse` - Horizontal ellipse
+- `ellipse_v` - Vertical ellipse
+- `random` - Random shape per source
 
-The GPU implementation supports running multiple simulations in parallel using a single dispatch:
+## Mega-Simulation Mode
+
+When `border_interaction` is enabled, parallel simulations are arranged in a grid where adjacent simulations can interact at their borders:
 
 ```yaml
 simulation:
-  parallel_sims: 8  # Run 8 different seeds simultaneously
+  parallel_sims: 256
+  parallel_layout: [16, 16]   # 16x16 grid of simulations
+  border_interaction: true    # Enable cross-border pairing
 ```
 
-This achieves near-linear scaling, allowing you to explore multiple random seeds at approximately the same speed as a single simulation.
+This creates a single large simulation grid (e.g., 4096x4096 programs for 16x16 layout of 256x256 sims) where programs at simulation edges can pair with programs in adjacent simulations. This enables genetic information to flow across the entire mega-grid.
+
+Cross-border pairs are generated first to ensure edge programs interact with neighbors, then internal pairs fill in the remaining programs.
+
+## Checkpointing
+
+Save and restore complete simulation state:
+
+```yaml
+checkpoint:
+  enabled: true
+  interval: 10000            # Save every 10000 epochs
+  path: "checkpoints"
+  resume_from: ""            # Set to checkpoint path to resume
+```
+
+Checkpoint files contain:
+- All program tapes (soup data)
+- Energy states (reserve, timer, dead status)
+- Current epoch
+- Configuration metadata for validation
+
+To resume from a checkpoint:
+```yaml
+checkpoint:
+  resume_from: "checkpoints/checkpoint_epoch_00010000_sims_256.bff"
+```
+
+## Raw Data Saving and Post-Processing
+
+For maximum simulation speed, save raw binary data during the run and render frames afterwards:
+
+### During Simulation (Maximum Speed)
+```yaml
+output:
+  frame_interval: 128
+  save_raw: true           # Save raw soup data
+  async_save: true         # Non-blocking saves
+  render_frames: false     # Skip rendering during sim
+```
+
+### Post-Simulation Rendering
+```bash
+# Render frames from saved raw data
+./render_frames.sh /path/to/raw_data /path/to/frames
+
+# Or use the binary directly
+./target/release/energetic-primordial-soup \
+  --render-raw /path/to/raw_data \
+  --frames-dir /path/to/frames \
+  --config config.yaml
+```
+
+Raw data files are compact binary dumps (~16MB for 256 sims at 256x256). The async writer ensures saves happen in a background thread without blocking the GPU.
 
 ## Output
 
 The simulation generates:
 
-- **PPM frames**: Raw image frames showing program state (color-coded by byte values)
+- **Frames**: PNG, JPEG, or PPM images showing program state (color-coded by byte values)
 - **MP4 videos**: Compressed videos created from frames via ffmpeg
 - **Log files**: Simulation statistics and progress
+- **Checkpoints**: Binary files for resuming simulations
+- **Raw data**: Binary soup dumps for post-processing
 
-When running parallel simulations, each simulation gets its own video:
-- `simulation.mp4` - Main video (first simulation)
-- `sim_0.mp4`, `sim_1.mp4`, ... - Individual simulation videos
+When running mega-simulations, a combined frame shows all simulations arranged in their grid layout.
+
+## CLI Options
+
+```
+USAGE:
+    energetic-primordial-soup [OPTIONS]
+    energetic-primordial-soup --config config.yaml
+    energetic-primordial-soup --generate-config [output.yaml]
+    energetic-primordial-soup --render-raw <raw_data_dir>
+
+CONFIG FILE:
+    -c, --config <FILE>       Load settings from YAML config file
+    --generate-config [FILE]  Generate template config (default: config.yaml)
+
+OPTIONS:
+    -w, --grid-width <N>      Grid width (default: 512)
+    -h, --grid-height <N>     Grid height (default: 256)
+    -s, --seed <N>            Random seed (default: 42)
+    -m, --mutation-prob <N>   Mutation probability (default: 262144)
+    --steps-per-run <N>       Steps per BFF run (default: 8192)
+    -e, --max-epochs <N>      Maximum epochs (default: 10000)
+    -n, --neighbor-range <N>  Neighbor range (default: 2)
+    -f, --frame-interval <N>  Save frame every N epochs (0 = disabled)
+    -d, --frames-dir <PATH>   Frames output directory
+
+ENERGY SYSTEM:
+    --energy                  Enable energy sources
+    --energy-sources <N>      Initial sources 1-8 (default: 4)
+    --energy-radius <N>       Radius of each source (default: 64)
+    --energy-reserve <N>      Reserve epochs when leaving zone (default: 5)
+    --energy-death <N>        Epochs until program death (default: 10)
+
+DYNAMIC ENERGY:
+    --energy-random           Randomize source positions
+    --energy-max-sources <N>  Max simultaneous sources (default: 8)
+    --energy-source-lifetime <N>  Epochs until source expires (0=infinite)
+    --energy-spawn-rate <N>   Spawn new source every N epochs (0=disabled)
+
+RAW DATA / ASYNC SAVE:
+    --save-raw                Save raw soup data
+    --raw-dir <PATH>          Raw data output directory
+    --async-save              Non-blocking saves (default)
+    --no-async-save           Blocking saves
+    --render-frames           Render frames during simulation
+    --no-render-frames        Skip rendering
+
+POST-PROCESSING:
+    --render-raw <PATH>       Render frames from raw data directory
+```
 
 ## BFF Instruction Set
 
@@ -173,12 +326,15 @@ Programs are paired and execute on a combined 128-byte tape (64 bytes from each 
 
 ## Performance
 
-On an NVIDIA RTX 4090 with a 1024x512 grid (524,288 programs):
+On an NVIDIA RTX 4090:
 
 | Configuration | Throughput |
 |--------------|------------|
-| Single simulation | ~166 billion ops/sec |
-| 8 parallel simulations | ~198 billion ops/sec total |
+| Single simulation (1024x512) | ~166 billion ops/sec |
+| 8 parallel simulations | ~198 billion ops/sec |
+| 256 mega-simulation (16x16 layout) | ~1900 billion ops/sec |
+
+Raw data saving with async mode has minimal performance impact as saves occur in a background thread.
 
 ## License
 
@@ -211,4 +367,3 @@ limitations under the License.
 ## Acknowledgments
 
 This implementation builds upon the foundational research by the Paradigms of Intelligence team at Google, exploring how self-replicating programs can emerge from simple computational substrates without explicit fitness landscapes.
-

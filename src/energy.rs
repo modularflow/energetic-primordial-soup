@@ -5,14 +5,87 @@
 //! Programs outside must rely on reserve energy or risk death.
 //!
 //! Key mechanics:
-//! - Energy sources are fixed points on the grid with a radius
+//! - Energy sources are fixed points on the grid with a radius/size
 //! - Programs leaving energy zones get reserve energy (default: 5 epochs)
 //! - Programs without interaction for too long die (default: 10 epochs)
 //! - Copy operations transfer energy to recipients
 //! - Sources can have lifetimes and spawn dynamically
+//! - Dead tapes in energy zones can spontaneously generate new programs
 
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+
+/// Shape of an energy source
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnergyShape {
+    /// Circular zone (radius in all directions)
+    Circle,
+    /// Horizontal strip (width = 2*radius, height = radius/2)
+    StripHorizontal,
+    /// Vertical strip (width = radius/2, height = 2*radius)
+    StripVertical,
+    /// Half circle (top half of a circle)
+    HalfCircleTop,
+    /// Half circle (bottom half)
+    HalfCircleBottom,
+    /// Half circle (left half)
+    HalfCircleLeft,
+    /// Half circle (right half)
+    HalfCircleRight,
+    /// Ellipse (width = 2*radius, height = radius)
+    EllipseHorizontal,
+    /// Ellipse (width = radius, height = 2*radius)
+    EllipseVertical,
+}
+
+impl EnergyShape {
+    /// Parse from string
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "circle" => EnergyShape::Circle,
+            "strip_h" | "strip_horizontal" | "horizontal_strip" => EnergyShape::StripHorizontal,
+            "strip_v" | "strip_vertical" | "vertical_strip" => EnergyShape::StripVertical,
+            "half_circle" | "half_circle_top" => EnergyShape::HalfCircleTop,
+            "half_circle_bottom" => EnergyShape::HalfCircleBottom,
+            "half_circle_left" => EnergyShape::HalfCircleLeft,
+            "half_circle_right" => EnergyShape::HalfCircleRight,
+            "ellipse" | "ellipse_h" | "ellipse_horizontal" => EnergyShape::EllipseHorizontal,
+            "ellipse_v" | "ellipse_vertical" => EnergyShape::EllipseVertical,
+            "random" => EnergyShape::Circle, // Random is handled at source creation
+            _ => EnergyShape::Circle,
+        }
+    }
+    
+    /// Get a random shape
+    pub fn random(rng: &mut impl Rng) -> Self {
+        match rng.random_range(0..9) {
+            0 => EnergyShape::Circle,
+            1 => EnergyShape::StripHorizontal,
+            2 => EnergyShape::StripVertical,
+            3 => EnergyShape::HalfCircleTop,
+            4 => EnergyShape::HalfCircleBottom,
+            5 => EnergyShape::HalfCircleLeft,
+            6 => EnergyShape::HalfCircleRight,
+            7 => EnergyShape::EllipseHorizontal,
+            _ => EnergyShape::EllipseVertical,
+        }
+    }
+    
+    /// Convert to GPU representation (0-8)
+    pub fn to_gpu_id(&self) -> u32 {
+        match self {
+            EnergyShape::Circle => 0,
+            EnergyShape::StripHorizontal => 1,
+            EnergyShape::StripVertical => 2,
+            EnergyShape::HalfCircleTop => 3,
+            EnergyShape::HalfCircleBottom => 4,
+            EnergyShape::HalfCircleLeft => 5,
+            EnergyShape::HalfCircleRight => 6,
+            EnergyShape::EllipseHorizontal => 7,
+            EnergyShape::EllipseVertical => 8,
+        }
+    }
+}
 
 /// An energy source on the grid
 #[derive(Clone, Debug, PartialEq)]
@@ -20,22 +93,61 @@ pub struct EnergySource {
     pub x: usize,
     pub y: usize,
     pub radius: usize,
+    pub shape: EnergyShape,
     /// Age in epochs (for lifetime tracking)
     pub age: usize,
 }
 
 impl EnergySource {
-    /// Create a new energy source
+    /// Create a new circular energy source
     pub fn new(x: usize, y: usize, radius: usize) -> Self {
-        Self { x, y, radius, age: 0 }
+        Self { x, y, radius, shape: EnergyShape::Circle, age: 0 }
+    }
+    
+    /// Create a new energy source with a specific shape
+    pub fn with_shape(x: usize, y: usize, radius: usize, shape: EnergyShape) -> Self {
+        Self { x, y, radius, shape, age: 0 }
     }
 
-    /// Check if a position is within this source's range (Euclidean distance)
+    /// Check if a position is within this source's range based on shape
     pub fn contains(&self, x: usize, y: usize) -> bool {
         let dx = x as f64 - self.x as f64;
         let dy = y as f64 - self.y as f64;
-        let distance = (dx * dx + dy * dy).sqrt();
-        distance <= self.radius as f64
+        let r = self.radius as f64;
+        
+        match self.shape {
+            EnergyShape::Circle => {
+                dx * dx + dy * dy <= r * r
+            }
+            EnergyShape::StripHorizontal => {
+                // Width = 2*radius, Height = radius/2
+                dx.abs() <= r && dy.abs() <= r / 4.0
+            }
+            EnergyShape::StripVertical => {
+                // Width = radius/2, Height = 2*radius
+                dx.abs() <= r / 4.0 && dy.abs() <= r
+            }
+            EnergyShape::HalfCircleTop => {
+                dy <= 0.0 && dx * dx + dy * dy <= r * r
+            }
+            EnergyShape::HalfCircleBottom => {
+                dy >= 0.0 && dx * dx + dy * dy <= r * r
+            }
+            EnergyShape::HalfCircleLeft => {
+                dx <= 0.0 && dx * dx + dy * dy <= r * r
+            }
+            EnergyShape::HalfCircleRight => {
+                dx >= 0.0 && dx * dx + dy * dy <= r * r
+            }
+            EnergyShape::EllipseHorizontal => {
+                // Width = 2*radius, Height = radius
+                (dx / r).powi(2) + (dy / (r / 2.0)).powi(2) <= 1.0
+            }
+            EnergyShape::EllipseVertical => {
+                // Width = radius, Height = 2*radius
+                (dx / (r / 2.0)).powi(2) + (dy / r).powi(2) <= 1.0
+            }
+        }
     }
 
     /// Get squared distance (for comparisons without sqrt)
@@ -89,6 +201,10 @@ pub struct EnergyConfig {
     pub interaction_death: u8,
     /// Default radius for new sources
     pub default_radius: usize,
+    /// Default shape for sources ("circle", "random", etc)
+    pub default_shape: String,
+    /// Spontaneous generation rate: 1 in N chance per dead tape in energy zone (0 = disabled)
+    pub spontaneous_rate: u32,
     /// Dynamic source options
     pub dynamic: DynamicEnergyConfig,
     /// Grid dimensions (for random placement)
@@ -106,6 +222,8 @@ impl Default for EnergyConfig {
             reserve_duration: 5,
             interaction_death: 10,
             default_radius: 64,
+            default_shape: "circle".to_string(),
+            spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
             grid_width: 512,
             grid_height: 256,
@@ -139,6 +257,19 @@ impl EnergyConfig {
         reserve_duration: u8,
         interaction_death: u8,
     ) -> Self {
+        Self::with_sources_and_shape(width, height, radius, count, reserve_duration, interaction_death, EnergyShape::Circle)
+    }
+    
+    /// Create a configuration with N sources and a specific shape
+    pub fn with_sources_and_shape(
+        width: usize,
+        height: usize,
+        radius: usize,
+        count: usize,
+        reserve_duration: u8,
+        interaction_death: u8,
+        shape: EnergyShape,
+    ) -> Self {
         let r = radius;
         let cx = width / 2;
         let cy = height / 2;
@@ -153,63 +284,63 @@ impl EnergyConfig {
             0 => {}
             1 => {
                 // Center only
-                sources.push(EnergySource::new(cx, cy, r));
+                sources.push(EnergySource::with_shape(cx, cy, r, shape));
             }
             2 => {
                 // Left and right centers
-                sources.push(EnergySource::new(left, cy, r));
-                sources.push(EnergySource::new(right, cy, r));
+                sources.push(EnergySource::with_shape(left, cy, r, shape));
+                sources.push(EnergySource::with_shape(right, cy, r, shape));
             }
             3 => {
                 // Center + two diagonal corners
-                sources.push(EnergySource::new(cx, cy, r));
-                sources.push(EnergySource::new(left, top, r));
-                sources.push(EnergySource::new(right, bottom, r));
+                sources.push(EnergySource::with_shape(cx, cy, r, shape));
+                sources.push(EnergySource::with_shape(left, top, r, shape));
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));
             }
             4 => {
                 // 4 corners (default)
-                sources.push(EnergySource::new(left, top, r));      // Top-left
-                sources.push(EnergySource::new(right, top, r));     // Top-right
-                sources.push(EnergySource::new(left, bottom, r));   // Bottom-left
-                sources.push(EnergySource::new(right, bottom, r));  // Bottom-right
+                sources.push(EnergySource::with_shape(left, top, r, shape));      // Top-left
+                sources.push(EnergySource::with_shape(right, top, r, shape));     // Top-right
+                sources.push(EnergySource::with_shape(left, bottom, r, shape));   // Bottom-left
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));  // Bottom-right
             }
             5 => {
                 // 4 corners + center
-                sources.push(EnergySource::new(left, top, r));
-                sources.push(EnergySource::new(right, top, r));
-                sources.push(EnergySource::new(left, bottom, r));
-                sources.push(EnergySource::new(right, bottom, r));
-                sources.push(EnergySource::new(cx, cy, r));
+                sources.push(EnergySource::with_shape(left, top, r, shape));
+                sources.push(EnergySource::with_shape(right, top, r, shape));
+                sources.push(EnergySource::with_shape(left, bottom, r, shape));
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));
+                sources.push(EnergySource::with_shape(cx, cy, r, shape));
             }
             6 => {
                 // 4 corners + top/bottom centers
-                sources.push(EnergySource::new(left, top, r));
-                sources.push(EnergySource::new(right, top, r));
-                sources.push(EnergySource::new(left, bottom, r));
-                sources.push(EnergySource::new(right, bottom, r));
-                sources.push(EnergySource::new(cx, top, r));
-                sources.push(EnergySource::new(cx, bottom, r));
+                sources.push(EnergySource::with_shape(left, top, r, shape));
+                sources.push(EnergySource::with_shape(right, top, r, shape));
+                sources.push(EnergySource::with_shape(left, bottom, r, shape));
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));
+                sources.push(EnergySource::with_shape(cx, top, r, shape));
+                sources.push(EnergySource::with_shape(cx, bottom, r, shape));
             }
             7 => {
                 // 4 corners + center + left/right centers  
-                sources.push(EnergySource::new(left, top, r));
-                sources.push(EnergySource::new(right, top, r));
-                sources.push(EnergySource::new(left, bottom, r));
-                sources.push(EnergySource::new(right, bottom, r));
-                sources.push(EnergySource::new(cx, cy, r));
-                sources.push(EnergySource::new(left, cy, r));
-                sources.push(EnergySource::new(right, cy, r));
+                sources.push(EnergySource::with_shape(left, top, r, shape));
+                sources.push(EnergySource::with_shape(right, top, r, shape));
+                sources.push(EnergySource::with_shape(left, bottom, r, shape));
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));
+                sources.push(EnergySource::with_shape(cx, cy, r, shape));
+                sources.push(EnergySource::with_shape(left, cy, r, shape));
+                sources.push(EnergySource::with_shape(right, cy, r, shape));
             }
             _ => {
                 // 8: 4 corners + 4 edge centers
-                sources.push(EnergySource::new(left, top, r));
-                sources.push(EnergySource::new(right, top, r));
-                sources.push(EnergySource::new(left, bottom, r));
-                sources.push(EnergySource::new(right, bottom, r));
-                sources.push(EnergySource::new(cx, top, r));
-                sources.push(EnergySource::new(cx, bottom, r));
-                sources.push(EnergySource::new(left, cy, r));
-                sources.push(EnergySource::new(right, cy, r));
+                sources.push(EnergySource::with_shape(left, top, r, shape));
+                sources.push(EnergySource::with_shape(right, top, r, shape));
+                sources.push(EnergySource::with_shape(left, bottom, r, shape));
+                sources.push(EnergySource::with_shape(right, bottom, r, shape));
+                sources.push(EnergySource::with_shape(cx, top, r, shape));
+                sources.push(EnergySource::with_shape(cx, bottom, r, shape));
+                sources.push(EnergySource::with_shape(left, cy, r, shape));
+                sources.push(EnergySource::with_shape(right, cy, r, shape));
             }
         }
 
@@ -219,6 +350,8 @@ impl EnergyConfig {
             reserve_duration,
             interaction_death,
             default_radius: radius,
+            default_shape: "circle".to_string(),
+            spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
             grid_width: width,
             grid_height: height,
@@ -240,6 +373,32 @@ impl EnergyConfig {
         spawn_rate: usize,
         seed: u64,
     ) -> Self {
+        Self::full_with_options(
+            width, height, radius, count, reserve_duration, interaction_death,
+            random_placement, max_sources, source_lifetime, spawn_rate, seed,
+            0, "circle".to_string(),
+        )
+    }
+    
+    /// Create a full configuration with all options including spontaneous generation and shape
+    pub fn full_with_options(
+        width: usize,
+        height: usize,
+        radius: usize,
+        count: usize,
+        reserve_duration: u8,
+        interaction_death: u8,
+        random_placement: bool,
+        max_sources: usize,
+        source_lifetime: usize,
+        spawn_rate: usize,
+        seed: u64,
+        spontaneous_rate: u32,
+        shape: String,
+    ) -> Self {
+        let use_random_shape = shape.to_lowercase() == "random";
+        let mut rng = StdRng::seed_from_u64(seed);
+        
         let mut config = if random_placement {
             // Start with empty sources, will be randomly placed
             Self {
@@ -248,6 +407,8 @@ impl EnergyConfig {
                 reserve_duration,
                 interaction_death,
                 default_radius: radius,
+                default_shape: shape.clone(),
+                spontaneous_rate,
                 dynamic: DynamicEnergyConfig {
                     random_placement: true,
                     max_sources,
@@ -256,17 +417,24 @@ impl EnergyConfig {
                 },
                 grid_width: width,
                 grid_height: height,
-                rng: StdRng::seed_from_u64(seed),
+                rng,
             }
         } else {
-            let mut c = Self::with_sources(width, height, radius, count, reserve_duration, interaction_death);
+            let source_shape = if use_random_shape {
+                EnergyShape::random(&mut rng)
+            } else {
+                EnergyShape::from_str(&shape)
+            };
+            let mut c = Self::with_sources_and_shape(width, height, radius, count, reserve_duration, interaction_death, source_shape);
+            c.default_shape = shape.clone();
+            c.spontaneous_rate = spontaneous_rate;
             c.dynamic = DynamicEnergyConfig {
                 random_placement: false,
                 max_sources,
                 source_lifetime,
                 spawn_rate,
             };
-            c.rng = StdRng::seed_from_u64(seed);
+            c.rng = rng;
             c
         };
         
@@ -293,6 +461,8 @@ impl EnergyConfig {
             reserve_duration,
             interaction_death,
             default_radius: 64,
+            default_shape: "circle".to_string(),
+            spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
             grid_width: 512,
             grid_height: 256,
@@ -300,7 +470,7 @@ impl EnergyConfig {
         }
     }
     
-    /// Spawn a new source at a random position
+    /// Spawn a new source at a random position with potentially random shape
     pub fn spawn_random_source(&mut self) -> bool {
         if self.sources.len() >= self.dynamic.max_sources {
             return false;
@@ -308,10 +478,17 @@ impl EnergyConfig {
         
         let r = self.default_radius;
         // Keep sources away from edges by radius
-        let x = self.rng.gen_range(r..self.grid_width.saturating_sub(r));
-        let y = self.rng.gen_range(r..self.grid_height.saturating_sub(r));
+        let x = self.rng.random_range(r..self.grid_width.saturating_sub(r));
+        let y = self.rng.random_range(r..self.grid_height.saturating_sub(r));
         
-        self.sources.push(EnergySource::new(x, y, r));
+        // Determine shape - if "random", pick a random shape
+        let shape = if self.default_shape.to_lowercase() == "random" {
+            EnergyShape::random(&mut self.rng)
+        } else {
+            EnergyShape::from_str(&self.default_shape)
+        };
+        
+        self.sources.push(EnergySource::with_shape(x, y, r, shape));
         true
     }
     

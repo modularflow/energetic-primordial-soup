@@ -8,6 +8,13 @@
 #   ./run.sh config.yaml         # Use specific config file
 #   MAX_EPOCHS=5000 ./run.sh     # Override specific values
 #
+# DIRECTORY BEHAVIOR:
+#   With config file: Uses frames_dir and checkpoint.path from config.yaml
+#   Without config:   Uses runs/{timestamp}_frames/ automatically
+#   
+#   To override and use runs/ folder even with config:
+#     USE_RUN_DIRS=true ./run.sh config.yaml
+#
 # The config file controls parallel_sims (GPU batched parallelism).
 # No need for separate parallel runner - it's built into the GPU simulation!
 #
@@ -57,12 +64,20 @@ ENERGY_SPAWN_RATE=${ENERGY_SPAWN_RATE:-0}
 # SETUP
 # ============================================================================
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
-FRAMES_DIR="runs/${RUN_ID}_frames"
-VIDEO_FILE="runs/${RUN_ID}_simulation.mp4"
-LOG_FILE="runs/${RUN_ID}_log.txt"
 
-mkdir -p runs
-mkdir -p "$FRAMES_DIR"
+# When using a config file, respect its directories by default
+# Set USE_RUN_DIRS=true to override and use runs/{timestamp}/ instead
+if [ -n "$CONFIG_FILE" ] && [ "${USE_RUN_DIRS:-false}" != true ]; then
+    # Config file mode: use directories from config.yaml
+    FRAMES_DIR=""
+    LOG_FILE="simulation_${RUN_ID}.log"
+else
+    # No config or explicit override: use runs/ folder
+    FRAMES_DIR="${FRAMES_DIR:-runs/${RUN_ID}_frames}"
+    LOG_FILE="runs/${RUN_ID}_log.txt"
+    mkdir -p runs
+    mkdir -p "$FRAMES_DIR"
+fi
 
 # ============================================================================
 # BUILD
@@ -91,9 +106,13 @@ if [ -n "$CONFIG_FILE" ]; then
     [ -n "${SEED_OVERRIDE:-}" ] && OVERRIDE_ARGS="$OVERRIDE_ARGS --seed $SEED_OVERRIDE"
     [ -n "${FRAME_INTERVAL_OVERRIDE:-}" ] && OVERRIDE_ARGS="$OVERRIDE_ARGS --frame-interval $FRAME_INTERVAL_OVERRIDE"
     
+    # Only override frames-dir if explicitly set (not using config dirs)
+    FRAMES_ARG=""
+    [ -n "$FRAMES_DIR" ] && FRAMES_ARG="--frames-dir $FRAMES_DIR"
+    
     ./target/release/energetic-primordial-soup \
         --config "$CONFIG_FILE" \
-        --frames-dir "$FRAMES_DIR" \
+        $FRAMES_ARG \
         $OVERRIDE_ARGS \
         2>&1 | tee "$LOG_FILE"
 else
@@ -141,12 +160,27 @@ echo ""
 echo ""
 echo "Generating videos..."
 
-# Main simulation video (from sim 0 / root frames)
-MAIN_FRAME_COUNT=$(find "$FRAMES_DIR" -maxdepth 1 -name "*.ppm" 2>/dev/null | wc -l)
+# If using config dirs, extract frames_dir from config file
+if [ -z "$FRAMES_DIR" ] && [ -n "$CONFIG_FILE" ]; then
+    FRAMES_DIR=$(grep -E "^\s*frames_dir:" "$CONFIG_FILE" | head -1 | sed 's/.*frames_dir:\s*["'\'']\?\([^"'\''#]*\)["'\'']\?.*/\1/' | xargs)
+    echo "  Using frames directory from config: $FRAMES_DIR"
+fi
+
+VIDEO_DIR=$(dirname "$FRAMES_DIR" 2>/dev/null || echo ".")
+VIDEO_FILE="${VIDEO_DIR}/simulation_${RUN_ID}.mp4"
+
+# Main simulation video (from sim 0 / root frames) - check for both png and ppm
+MAIN_FRAME_COUNT=$(find "$FRAMES_DIR" -maxdepth 1 \( -name "*.ppm" -o -name "*.png" \) 2>/dev/null | wc -l)
 if [ "$MAIN_FRAME_COUNT" -gt 0 ]; then
+    # Detect format
+    if [ -f "${FRAMES_DIR}"/*.png 2>/dev/null ]; then
+        FRAME_PATTERN="${FRAMES_DIR}/*.png"
+    else
+        FRAME_PATTERN="${FRAMES_DIR}/*.ppm"
+    fi
     echo "  Main: $MAIN_FRAME_COUNT frames -> $VIDEO_FILE"
     ffmpeg -y -framerate "$VIDEO_FPS" \
-        -pattern_type glob -i "${FRAMES_DIR}/*.ppm" \
+        -pattern_type glob -i "$FRAME_PATTERN" \
         -c:v libx264 -pix_fmt yuv420p -crf 18 \
         "$VIDEO_FILE" 2>/dev/null
 fi
@@ -155,21 +189,27 @@ fi
 for sim_dir in "$FRAMES_DIR"/sim_*; do
     if [ -d "$sim_dir" ]; then
         sim_name=$(basename "$sim_dir")
-        sim_frames=$(find "$sim_dir" -name "*.ppm" 2>/dev/null | wc -l)
+        sim_frames=$(find "$sim_dir" \( -name "*.ppm" -o -name "*.png" \) 2>/dev/null | wc -l)
         if [ "$sim_frames" -gt 0 ]; then
-            sim_video="runs/${RUN_ID}_${sim_name}.mp4"
+            sim_video="${VIDEO_DIR}/${sim_name}_${RUN_ID}.mp4"
+            # Detect format
+            if ls "${sim_dir}"/*.png 1>/dev/null 2>&1; then
+                SIM_PATTERN="${sim_dir}/*.png"
+            else
+                SIM_PATTERN="${sim_dir}/*.ppm"
+            fi
             echo "  $sim_name: $sim_frames frames -> $sim_video"
             ffmpeg -y -framerate "$VIDEO_FPS" \
-                -pattern_type glob -i "${sim_dir}/*.ppm" \
+                -pattern_type glob -i "$SIM_PATTERN" \
                 -c:v libx264 -pix_fmt yuv420p -crf 18 \
                 "$sim_video" 2>/dev/null
         fi
     fi
 done
 
-# Cleanup frames if requested
-if [ "$KEEP_FRAMES" = false ]; then
-    TOTAL_FRAMES=$(find "$FRAMES_DIR" -name "*.ppm" 2>/dev/null | wc -l)
+# Cleanup frames if requested (only for auto-generated run dirs)
+if [ "$KEEP_FRAMES" = false ] && [[ "$FRAMES_DIR" == runs/* ]]; then
+    TOTAL_FRAMES=$(find "$FRAMES_DIR" \( -name "*.ppm" -o -name "*.png" \) 2>/dev/null | wc -l)
     if [ "$TOTAL_FRAMES" -gt 0 ]; then
         echo "  Cleaning up $TOTAL_FRAMES frame files..."
         rm -rf "$FRAMES_DIR"

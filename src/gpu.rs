@@ -310,16 +310,16 @@ struct EnergyParams {
     radius: u32,
     reserve_duration: u32,
     death_timer: u32,
-    _pad: u32,
-    // Up to 8 source positions (x, y pairs)
-    src0_x: u32, src0_y: u32,
-    src1_x: u32, src1_y: u32,
-    src2_x: u32, src2_y: u32,
-    src3_x: u32, src3_y: u32,
-    src4_x: u32, src4_y: u32,
-    src5_x: u32, src5_y: u32,
-    src6_x: u32, src6_y: u32,
-    src7_x: u32, src7_y: u32,
+    spontaneous_rate: u32,  // 1 in N chance for dead tape in zone to spawn (0 = disabled)
+    // Up to 8 sources: x, y, shape, radius
+    src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
+    src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
+    src2_x: u32, src2_y: u32, src2_shape: u32, src2_radius: u32,
+    src3_x: u32, src3_y: u32, src3_shape: u32, src3_radius: u32,
+    src4_x: u32, src4_y: u32, src4_shape: u32, src4_radius: u32,
+    src5_x: u32, src5_y: u32, src5_shape: u32, src5_radius: u32,
+    src6_x: u32, src6_y: u32, src6_shape: u32, src6_radius: u32,
+    src7_x: u32, src7_y: u32, src7_shape: u32, src7_radius: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> soup: array<u32>;
@@ -334,11 +334,49 @@ fn lcg(seed: u32) -> u32 {
     return seed * 1664525u + 1013904223u;
 }
 
-// Check distance squared helper
-fn dist_sq(x: u32, y: u32, sx: u32, sy: u32) -> u32 {
-    let dx = i32(x) - i32(sx);
-    let dy = i32(y) - i32(sy);
-    return u32(dx * dx + dy * dy);
+// Check if point (x,y) is within a source at (sx,sy) with given shape and radius
+// Shape IDs: 0=Circle, 1=StripH, 2=StripV, 3=HalfTop, 4=HalfBottom, 5=HalfLeft, 6=HalfRight, 7=EllipseH, 8=EllipseV
+fn in_source(x: i32, y: i32, sx: u32, sy: u32, shape: u32, radius: u32) -> bool {
+    let dx = f32(x) - f32(i32(sx));
+    let dy = f32(y) - f32(i32(sy));
+    let r = f32(radius);
+    let r_sq = r * r;
+    let dist_sq = dx * dx + dy * dy;
+    
+    switch (shape) {
+        case 0u: { // Circle
+            return dist_sq <= r_sq;
+        }
+        case 1u: { // Strip Horizontal (width=2r, height=r/2)
+            return abs(dx) <= r && abs(dy) <= r / 4.0;
+        }
+        case 2u: { // Strip Vertical (width=r/2, height=2r)
+            return abs(dx) <= r / 4.0 && abs(dy) <= r;
+        }
+        case 3u: { // Half Circle Top
+            return dy <= 0.0 && dist_sq <= r_sq;
+        }
+        case 4u: { // Half Circle Bottom
+            return dy >= 0.0 && dist_sq <= r_sq;
+        }
+        case 5u: { // Half Circle Left
+            return dx <= 0.0 && dist_sq <= r_sq;
+        }
+        case 6u: { // Half Circle Right
+            return dx >= 0.0 && dist_sq <= r_sq;
+        }
+        case 7u: { // Ellipse Horizontal (width=2r, height=r)
+            let norm = (dx / r) * (dx / r) + (dy / (r / 2.0)) * (dy / (r / 2.0));
+            return norm <= 1.0;
+        }
+        case 8u: { // Ellipse Vertical (width=r, height=2r)
+            let norm = (dx / (r / 2.0)) * (dx / (r / 2.0)) + (dy / r) * (dy / r);
+            return norm <= 1.0;
+        }
+        default: {
+            return dist_sq <= r_sq; // Default to circle
+        }
+    }
 }
 
 // Check if position is within any energy zone
@@ -347,20 +385,19 @@ fn in_energy_zone(prog_idx: u32) -> bool {
         return true; // Energy disabled = everywhere is energized
     }
     
-    let x = prog_idx % params.grid_width;
-    let y = prog_idx / params.grid_width;
-    let radius_sq = energy_params.radius * energy_params.radius;
+    let x = i32(prog_idx % params.grid_width);
+    let y = i32(prog_idx / params.grid_width);
     let n = energy_params.num_sources;
     
-    // Check distance to each source (up to 8)
-    if (n >= 1u && dist_sq(x, y, energy_params.src0_x, energy_params.src0_y) <= radius_sq) { return true; }
-    if (n >= 2u && dist_sq(x, y, energy_params.src1_x, energy_params.src1_y) <= radius_sq) { return true; }
-    if (n >= 3u && dist_sq(x, y, energy_params.src2_x, energy_params.src2_y) <= radius_sq) { return true; }
-    if (n >= 4u && dist_sq(x, y, energy_params.src3_x, energy_params.src3_y) <= radius_sq) { return true; }
-    if (n >= 5u && dist_sq(x, y, energy_params.src4_x, energy_params.src4_y) <= radius_sq) { return true; }
-    if (n >= 6u && dist_sq(x, y, energy_params.src5_x, energy_params.src5_y) <= radius_sq) { return true; }
-    if (n >= 7u && dist_sq(x, y, energy_params.src6_x, energy_params.src6_y) <= radius_sq) { return true; }
-    if (n >= 8u && dist_sq(x, y, energy_params.src7_x, energy_params.src7_y) <= radius_sq) { return true; }
+    // Check each source with its shape
+    if (n >= 1u && in_source(x, y, energy_params.src0_x, energy_params.src0_y, energy_params.src0_shape, energy_params.src0_radius)) { return true; }
+    if (n >= 2u && in_source(x, y, energy_params.src1_x, energy_params.src1_y, energy_params.src1_shape, energy_params.src1_radius)) { return true; }
+    if (n >= 3u && in_source(x, y, energy_params.src2_x, energy_params.src2_y, energy_params.src2_shape, energy_params.src2_radius)) { return true; }
+    if (n >= 4u && in_source(x, y, energy_params.src3_x, energy_params.src3_y, energy_params.src3_shape, energy_params.src3_radius)) { return true; }
+    if (n >= 5u && in_source(x, y, energy_params.src4_x, energy_params.src4_y, energy_params.src4_shape, energy_params.src4_radius)) { return true; }
+    if (n >= 6u && in_source(x, y, energy_params.src5_x, energy_params.src5_y, energy_params.src5_shape, energy_params.src5_radius)) { return true; }
+    if (n >= 7u && in_source(x, y, energy_params.src6_x, energy_params.src6_y, energy_params.src6_shape, energy_params.src6_radius)) { return true; }
+    if (n >= 8u && in_source(x, y, energy_params.src7_x, energy_params.src7_y, energy_params.src7_shape, energy_params.src7_radius)) { return true; }
     
     return false;
 }
@@ -588,23 +625,25 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (pos >= i32(FULL_TAPE_SIZE)) { break; }
     }
     
-    // Copy results back to global soup
-    for (var i = 0u; i < 16u; i++) {
-        soup[p1_base + i] = tape[i];
-        soup[p2_base + i] = tape[i + 16u];
-    }
+    // Track if programs were dead at START of epoch (before any revival)
+    let p1_was_dead = is_dead(p1_state);
+    let p2_was_dead = is_dead(p2_state);
     
-    // Update energy states if enabled
+    // Update energy states if enabled (before writing soup back)
+    var p1_stays_dead = false;
+    var p2_stays_dead = false;
+    
     if (energy_params.enabled != 0u) {
         // Process p1 energy
         var p1_reserve = get_reserve(p1_state);
         var p1_timer = get_timer(p1_state);
-        var p1_dead = is_dead(p1_state);
+        var p1_dead = p1_was_dead;
         
         if (p1_in_zone) {
             // In zone: full reserve, reset timer
             p1_reserve = energy_params.reserve_duration;
             p1_timer = 0u;
+            // Note: dead programs in zone stay dead until they receive a copy
         } else {
             // Outside zone
             if (p1_received_copy) {
@@ -612,28 +651,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let p2_reserve = select(energy_params.reserve_duration, get_reserve(p2_state), !p2_in_zone);
                 p1_reserve = p2_reserve;
                 p1_timer = 0u;
-                p1_dead = false;
+                p1_dead = false;  // REVIVED!
             } else {
                 // No interaction: decrement reserve, increment timer
                 if (p1_reserve > 0u) { p1_reserve -= 1u; }
-                p1_timer += 1u;
+                if (!p1_dead) {
+                    p1_timer += 1u;
+                }
                 
                 // Check death
                 if (p1_timer > energy_params.death_timer && !p1_dead) {
                     p1_dead = true;
-                    // Zero the tape
-                    for (var i = 0u; i < 16u; i++) {
-                        soup[p1_base + i] = 0u;
-                    }
                 }
             }
         }
+        
+        // If program was dead and remains dead, keep tape zeroed
+        p1_stays_dead = p1_was_dead && p1_dead;
+        
         energy_state[p1_idx] = pack_state(p1_reserve, p1_timer, p1_dead);
         
         // Process p2 energy
         var p2_reserve = get_reserve(p2_state);
         var p2_timer = get_timer(p2_state);
-        var p2_dead = is_dead(p2_state);
+        var p2_dead = p2_was_dead;
         
         if (p2_in_zone) {
             p2_reserve = energy_params.reserve_duration;
@@ -643,20 +684,54 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let p1_reserve_for_inherit = select(energy_params.reserve_duration, get_reserve(p1_state), !p1_in_zone);
                 p2_reserve = p1_reserve_for_inherit;
                 p2_timer = 0u;
-                p2_dead = false;
+                p2_dead = false;  // REVIVED!
             } else {
                 if (p2_reserve > 0u) { p2_reserve -= 1u; }
-                p2_timer += 1u;
+                if (!p2_dead) {
+                    p2_timer += 1u;
+                }
                 
                 if (p2_timer > energy_params.death_timer && !p2_dead) {
                     p2_dead = true;
-                    for (var i = 0u; i < 16u; i++) {
-                        soup[p2_base + i] = 0u;
-                    }
                 }
             }
         }
+        
+        p2_stays_dead = p2_was_dead && p2_dead;
+        
         energy_state[p2_idx] = pack_state(p2_reserve, p2_timer, p2_dead);
+    }
+    
+    // Copy results back to global soup
+    // Dead tapes that weren't revived stay zeroed
+    if (p1_stays_dead) {
+        for (var i = 0u; i < 16u; i++) {
+            soup[p1_base + i] = 0u;
+        }
+    } else if (is_dead(energy_state[p1_idx])) {
+        // Just died this epoch - zero the tape
+        for (var i = 0u; i < 16u; i++) {
+            soup[p1_base + i] = 0u;
+        }
+    } else {
+        for (var i = 0u; i < 16u; i++) {
+            soup[p1_base + i] = tape[i];
+        }
+    }
+    
+    if (p2_stays_dead) {
+        for (var i = 0u; i < 16u; i++) {
+            soup[p2_base + i] = 0u;
+        }
+    } else if (is_dead(energy_state[p2_idx])) {
+        // Just died this epoch - zero the tape
+        for (var i = 0u; i < 16u; i++) {
+            soup[p2_base + i] = 0u;
+        }
+    } else {
+        for (var i = 0u; i < 16u; i++) {
+            soup[p2_base + i] = tape[i + 16u];
+        }
     }
     
     atomicAdd(&ops_count, params.steps_per_run - nskip);
@@ -679,8 +754,8 @@ struct Params {
     epoch_lo: u32,
     epoch_hi: u32,
     num_programs: u32,  // Programs per simulation
-    num_sims: u32,      // Number of simulations (global_id.y range)
-    _pad0: u32,
+    num_sims: u32,      // Number of simulations
+    mega_mode: u32,     // 0 = normal batched (pairs local), 1 = mega (pairs are absolute indices)
     _pad1: u32,
 }
 
@@ -690,15 +765,15 @@ struct EnergyParams {
     radius: u32,
     reserve_duration: u32,
     death_timer: u32,
-    _pad: u32,
-    src0_x: u32, src0_y: u32,
-    src1_x: u32, src1_y: u32,
-    src2_x: u32, src2_y: u32,
-    src3_x: u32, src3_y: u32,
-    src4_x: u32, src4_y: u32,
-    src5_x: u32, src5_y: u32,
-    src6_x: u32, src6_y: u32,
-    src7_x: u32, src7_y: u32,
+    spontaneous_rate: u32,
+    src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
+    src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
+    src2_x: u32, src2_y: u32, src2_shape: u32, src2_radius: u32,
+    src3_x: u32, src3_y: u32, src3_shape: u32, src3_radius: u32,
+    src4_x: u32, src4_y: u32, src4_shape: u32, src4_radius: u32,
+    src5_x: u32, src5_y: u32, src5_shape: u32, src5_radius: u32,
+    src6_x: u32, src6_y: u32, src6_shape: u32, src6_radius: u32,
+    src7_x: u32, src7_y: u32, src7_shape: u32, src7_radius: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> soup: array<u32>;
@@ -712,27 +787,74 @@ fn lcg(seed: u32) -> u32 {
     return seed * 1664525u + 1013904223u;
 }
 
-fn dist_sq(x: u32, y: u32, sx: u32, sy: u32) -> u32 {
-    let dx = i32(x) - i32(sx);
-    let dy = i32(y) - i32(sy);
-    return u32(dx * dx + dy * dy);
+// Check if point is within source (with shape support)
+fn in_source_batched(x: i32, y: i32, sx: u32, sy: u32, shape: u32, radius: u32) -> bool {
+    let dx = f32(x) - f32(i32(sx));
+    let dy = f32(y) - f32(i32(sy));
+    let r = f32(radius);
+    let r_sq = r * r;
+    let dist_sq = dx * dx + dy * dy;
+    
+    switch (shape) {
+        case 0u: { return dist_sq <= r_sq; }
+        case 1u: { return abs(dx) <= r && abs(dy) <= r / 4.0; }
+        case 2u: { return abs(dx) <= r / 4.0 && abs(dy) <= r; }
+        case 3u: { return dy <= 0.0 && dist_sq <= r_sq; }
+        case 4u: { return dy >= 0.0 && dist_sq <= r_sq; }
+        case 5u: { return dx <= 0.0 && dist_sq <= r_sq; }
+        case 6u: { return dx >= 0.0 && dist_sq <= r_sq; }
+        case 7u: { let norm = (dx/r)*(dx/r) + (dy/(r/2.0))*(dy/(r/2.0)); return norm <= 1.0; }
+        case 8u: { let norm = (dx/(r/2.0))*(dx/(r/2.0)) + (dy/r)*(dy/r); return norm <= 1.0; }
+        default: { return dist_sq <= r_sq; }
+    }
 }
 
-fn in_energy_zone(prog_idx: u32) -> bool {
+// Hash function to generate per-sim offsets for energy sources
+fn sim_hash(sim_idx: u32, src_idx: u32) -> u32 {
+    var h = sim_idx * 0x9E3779B9u + src_idx * 0x85EBCA6Bu;
+    h = h ^ (h >> 16u);
+    h = h * 0x21F0AAADu;
+    h = h ^ (h >> 15u);
+    return h;
+}
+
+// Get per-sim offset for a source position
+fn source_offset_x(sim_idx: u32, src_idx: u32, base_x: u32) -> u32 {
+    let h = sim_hash(sim_idx, src_idx * 2u);
+    let offset = i32(h % params.grid_width) - i32(params.grid_width / 2u);
+    let new_x = i32(base_x) + offset;
+    return u32((new_x + i32(params.grid_width)) % i32(params.grid_width));
+}
+
+fn source_offset_y(sim_idx: u32, src_idx: u32, base_y: u32) -> u32 {
+    let h = sim_hash(sim_idx, src_idx * 2u + 1u);
+    let grid_height = params.num_programs / params.grid_width;
+    let offset = i32(h % grid_height) - i32(grid_height / 2u);
+    let new_y = i32(base_y) + offset;
+    return u32((new_y + i32(grid_height)) % i32(grid_height));
+}
+
+fn in_energy_zone_sim(prog_idx: u32, sim_idx: u32) -> bool {
     if (energy_params.enabled == 0u) { return true; }
-    let x = prog_idx % params.grid_width;
-    let y = prog_idx / params.grid_width;
-    let radius_sq = energy_params.radius * energy_params.radius;
+    let x = i32(prog_idx % params.grid_width);
+    let y = i32(prog_idx / params.grid_width);
     let n = energy_params.num_sources;
-    if (n >= 1u && dist_sq(x, y, energy_params.src0_x, energy_params.src0_y) <= radius_sq) { return true; }
-    if (n >= 2u && dist_sq(x, y, energy_params.src1_x, energy_params.src1_y) <= radius_sq) { return true; }
-    if (n >= 3u && dist_sq(x, y, energy_params.src2_x, energy_params.src2_y) <= radius_sq) { return true; }
-    if (n >= 4u && dist_sq(x, y, energy_params.src3_x, energy_params.src3_y) <= radius_sq) { return true; }
-    if (n >= 5u && dist_sq(x, y, energy_params.src4_x, energy_params.src4_y) <= radius_sq) { return true; }
-    if (n >= 6u && dist_sq(x, y, energy_params.src5_x, energy_params.src5_y) <= radius_sq) { return true; }
-    if (n >= 7u && dist_sq(x, y, energy_params.src6_x, energy_params.src6_y) <= radius_sq) { return true; }
-    if (n >= 8u && dist_sq(x, y, energy_params.src7_x, energy_params.src7_y) <= radius_sq) { return true; }
+    
+    // Each source gets a per-sim random offset
+    if (n >= 1u && in_source_batched(x, y, source_offset_x(sim_idx, 0u, energy_params.src0_x), source_offset_y(sim_idx, 0u, energy_params.src0_y), energy_params.src0_shape, energy_params.src0_radius)) { return true; }
+    if (n >= 2u && in_source_batched(x, y, source_offset_x(sim_idx, 1u, energy_params.src1_x), source_offset_y(sim_idx, 1u, energy_params.src1_y), energy_params.src1_shape, energy_params.src1_radius)) { return true; }
+    if (n >= 3u && in_source_batched(x, y, source_offset_x(sim_idx, 2u, energy_params.src2_x), source_offset_y(sim_idx, 2u, energy_params.src2_y), energy_params.src2_shape, energy_params.src2_radius)) { return true; }
+    if (n >= 4u && in_source_batched(x, y, source_offset_x(sim_idx, 3u, energy_params.src3_x), source_offset_y(sim_idx, 3u, energy_params.src3_y), energy_params.src3_shape, energy_params.src3_radius)) { return true; }
+    if (n >= 5u && in_source_batched(x, y, source_offset_x(sim_idx, 4u, energy_params.src4_x), source_offset_y(sim_idx, 4u, energy_params.src4_y), energy_params.src4_shape, energy_params.src4_radius)) { return true; }
+    if (n >= 6u && in_source_batched(x, y, source_offset_x(sim_idx, 5u, energy_params.src5_x), source_offset_y(sim_idx, 5u, energy_params.src5_y), energy_params.src5_shape, energy_params.src5_radius)) { return true; }
+    if (n >= 7u && in_source_batched(x, y, source_offset_x(sim_idx, 6u, energy_params.src6_x), source_offset_y(sim_idx, 6u, energy_params.src6_y), energy_params.src6_shape, energy_params.src6_radius)) { return true; }
+    if (n >= 8u && in_source_batched(x, y, source_offset_x(sim_idx, 7u, energy_params.src7_x), source_offset_y(sim_idx, 7u, energy_params.src7_y), energy_params.src7_shape, energy_params.src7_radius)) { return true; }
     return false;
+}
+
+// Keep original for backwards compatibility (sim_idx = 0)
+fn in_energy_zone(prog_idx: u32) -> bool {
+    return in_energy_zone_sim(prog_idx, 0u);
 }
 
 fn get_reserve(state: u32) -> u32 { return state & 0xFFu; }
@@ -742,42 +864,79 @@ fn pack_state(reserve: u32, timer: u32, dead: bool) -> u32 {
     return (reserve & 0xFFu) | ((timer & 0xFFu) << 8u) | (select(0u, 1u, dead) << 16u);
 }
 
-fn can_mutate(prog_idx: u32, sim_offset: u32) -> bool {
+fn can_mutate_sim(prog_idx: u32, sim_offset: u32, sim_idx: u32) -> bool {
     if (energy_params.enabled == 0u) { return true; }
     let state = energy_state[sim_offset + prog_idx];
     if (is_dead(state)) { return false; }
-    return in_energy_zone(prog_idx) || get_reserve(state) > 0u;
+    return in_energy_zone_sim(prog_idx, sim_idx) || get_reserve(state) > 0u;
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pair_idx = global_id.x;
-    let sim_idx = global_id.y;
     
-    if (pair_idx >= params.num_pairs || sim_idx >= params.num_sims) { return; }
+    // In mega mode: pairs are absolute indices, dispatch y=1
+    // In normal mode: pairs are local, dispatch y=num_sims
+    var sim_idx = global_id.y;
     
-    // Offset for this simulation's data in concatenated buffers
-    let soup_offset = sim_idx * params.num_programs * (SINGLE_TAPE_SIZE / 4u);
-    let energy_offset = sim_idx * params.num_programs;
+    if (params.mega_mode == 0u) {
+        // Normal batched mode
+        if (pair_idx >= params.num_pairs || sim_idx >= params.num_sims) { return; }
+    } else {
+        // Mega mode: all pairs in x dimension
+        if (pair_idx >= params.num_pairs) { return; }
+    }
     
-    let p1_idx = pairs[pair_idx * 2u];
-    let p2_idx = pairs[pair_idx * 2u + 1u];
+    // Read pair indices
+    let raw_p1 = pairs[pair_idx * 2u];
+    let raw_p2 = pairs[pair_idx * 2u + 1u];
     
-    // Load energy states (with offset)
-    var p1_state = energy_state[energy_offset + p1_idx];
-    var p2_state = energy_state[energy_offset + p2_idx];
-    let p1_in_zone = in_energy_zone(p1_idx);
-    let p2_in_zone = in_energy_zone(p2_idx);
-    let p1_can_mutate = can_mutate(p1_idx, energy_offset);
-    let p2_can_mutate = can_mutate(p2_idx, energy_offset);
+    // In mega mode, pairs are absolute indices; in normal mode, they're local
+    var p1_abs: u32;
+    var p2_abs: u32;
+    var p1_local: u32;
+    var p2_local: u32;
+    var p1_sim: u32;
+    var p2_sim: u32;
+    
+    if (params.mega_mode == 0u) {
+        // Normal mode: add sim offset
+        p1_local = raw_p1;
+        p2_local = raw_p2;
+        p1_sim = sim_idx;
+        p2_sim = sim_idx;
+        p1_abs = sim_idx * params.num_programs + raw_p1;
+        p2_abs = sim_idx * params.num_programs + raw_p2;
+    } else {
+        // Mega mode: pairs are already absolute
+        p1_abs = raw_p1;
+        p2_abs = raw_p2;
+        p1_sim = raw_p1 / params.num_programs;
+        p2_sim = raw_p2 / params.num_programs;
+        p1_local = raw_p1 % params.num_programs;
+        p2_local = raw_p2 % params.num_programs;
+        sim_idx = p1_sim; // Use p1's sim for RNG
+    }
+    
+    // Energy offsets for each program's simulation
+    let p1_energy_offset = p1_sim * params.num_programs;
+    let p2_energy_offset = p2_sim * params.num_programs;
+    
+    // Load energy states (each sim has different energy zone positions)
+    var p1_state = energy_state[p1_energy_offset + p1_local];
+    var p2_state = energy_state[p2_energy_offset + p2_local];
+    let p1_in_zone = in_energy_zone_sim(p1_local, p1_sim);
+    let p2_in_zone = in_energy_zone_sim(p2_local, p2_sim);
+    let p1_can_mutate = can_mutate_sim(p1_local, p1_energy_offset, p1_sim);
+    let p2_can_mutate = can_mutate_sim(p2_local, p2_energy_offset, p2_sim);
     
     var p1_received_copy = false;
     var p2_received_copy = false;
     var tape: array<u32, 32>;
     
-    // Load soup (with offset)
-    let p1_base = soup_offset + p1_idx * (SINGLE_TAPE_SIZE / 4u);
-    let p2_base = soup_offset + p2_idx * (SINGLE_TAPE_SIZE / 4u);
+    // Load soup using absolute positions
+    let p1_base = p1_abs * (SINGLE_TAPE_SIZE / 4u);
+    let p2_base = p2_abs * (SINGLE_TAPE_SIZE / 4u);
     for (var i = 0u; i < 16u; i++) {
         tape[i] = soup[p1_base + i];
         tape[i + 16u] = soup[p2_base + i];
@@ -929,17 +1088,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (pos >= i32(FULL_TAPE_SIZE)) { break; }
     }
     
-    // Write back soup
-    for (var i = 0u; i < 16u; i++) {
-        soup[p1_base + i] = tape[i];
-        soup[p2_base + i] = tape[i + 16u];
-    }
+    // Track if programs were dead at START of epoch
+    let p1_was_dead = is_dead(p1_state);
+    let p2_was_dead = is_dead(p2_state);
     
-    // Update energy states
+    // Update energy states (before writing soup back)
+    var p1_stays_dead = false;
+    var p2_stays_dead = false;
+    
     if (energy_params.enabled != 0u) {
         var p1_reserve = get_reserve(p1_state);
         var p1_timer = get_timer(p1_state);
-        var p1_dead = is_dead(p1_state);
+        var p1_dead = p1_was_dead;
         if (p1_in_zone) {
             p1_reserve = energy_params.reserve_duration;
             p1_timer = 0u;
@@ -950,17 +1110,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             p1_dead = false;
         } else {
             if (p1_reserve > 0u) { p1_reserve -= 1u; }
-            p1_timer += 1u;
+            if (!p1_dead) { p1_timer += 1u; }
             if (p1_timer > energy_params.death_timer && !p1_dead) {
                 p1_dead = true;
-                for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
             }
         }
-        energy_state[energy_offset + p1_idx] = pack_state(p1_reserve, p1_timer, p1_dead);
+        p1_stays_dead = p1_was_dead && p1_dead;
+        energy_state[p1_energy_offset + p1_local] = pack_state(p1_reserve, p1_timer, p1_dead);
         
         var p2_reserve = get_reserve(p2_state);
         var p2_timer = get_timer(p2_state);
-        var p2_dead = is_dead(p2_state);
+        var p2_dead = p2_was_dead;
         if (p2_in_zone) {
             p2_reserve = energy_params.reserve_duration;
             p2_timer = 0u;
@@ -971,13 +1131,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             p2_dead = false;
         } else {
             if (p2_reserve > 0u) { p2_reserve -= 1u; }
-            p2_timer += 1u;
+            if (!p2_dead) { p2_timer += 1u; }
             if (p2_timer > energy_params.death_timer && !p2_dead) {
                 p2_dead = true;
-                for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
             }
         }
-        energy_state[energy_offset + p2_idx] = pack_state(p2_reserve, p2_timer, p2_dead);
+        p2_stays_dead = p2_was_dead && p2_dead;
+        energy_state[p2_energy_offset + p2_local] = pack_state(p2_reserve, p2_timer, p2_dead);
+    }
+    
+    // Write back soup - dead tapes stay zeroed
+    if (p1_stays_dead) {
+        for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
+    } else if (is_dead(energy_state[p1_energy_offset + p1_local])) {
+        for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
+    } else {
+        for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = tape[i]; }
+    }
+    
+    if (p2_stays_dead) {
+        for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
+    } else if (is_dead(energy_state[p2_energy_offset + p2_local])) {
+        for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
+    } else {
+        for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = tape[i + 16u]; }
     }
     
     atomicAdd(&ops_count, params.steps_per_run - nskip);
@@ -1011,7 +1188,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         epoch_hi: u32,
         num_programs: u32,
         num_sims: u32,
-        _pad0: u32,
+        mega_mode: u32,  // 0 = normal batched, 1 = mega mode with absolute indices
         _pad1: u32,
     }
 
@@ -1023,16 +1200,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         radius: u32,
         reserve_duration: u32,
         death_timer: u32,
-        _pad: u32,
-        // Up to 8 sources
-        src0_x: u32, src0_y: u32,
-        src1_x: u32, src1_y: u32,
-        src2_x: u32, src2_y: u32,
-        src3_x: u32, src3_y: u32,
-        src4_x: u32, src4_y: u32,
-        src5_x: u32, src5_y: u32,
-        src6_x: u32, src6_y: u32,
-        src7_x: u32, src7_y: u32,
+        spontaneous_rate: u32,  // 1 in N chance per dead tape in zone (0 = disabled)
+        // Up to 8 sources: x, y, shape_id (packed), radius_override
+        src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
+        src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
+        src2_x: u32, src2_y: u32, src2_shape: u32, src2_radius: u32,
+        src3_x: u32, src3_y: u32, src3_shape: u32, src3_radius: u32,
+        src4_x: u32, src4_y: u32, src4_shape: u32, src4_radius: u32,
+        src5_x: u32, src5_y: u32, src5_shape: u32, src5_radius: u32,
+        src6_x: u32, src6_y: u32, src6_shape: u32, src6_radius: u32,
+        src7_x: u32, src7_y: u32, src7_shape: u32, src7_radius: u32,
     }
 
     impl EnergyParams {
@@ -1043,15 +1220,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 radius: 0,
                 reserve_duration: 5,
                 death_timer: 10,
-                _pad: 0,
-                src0_x: 0, src0_y: 0,
-                src1_x: 0, src1_y: 0,
-                src2_x: 0, src2_y: 0,
-                src3_x: 0, src3_y: 0,
-                src4_x: 0, src4_y: 0,
-                src5_x: 0, src5_y: 0,
-                src6_x: 0, src6_y: 0,
-                src7_x: 0, src7_y: 0,
+                spontaneous_rate: 0,
+                src0_x: 0, src0_y: 0, src0_shape: 0, src0_radius: 64,
+                src1_x: 0, src1_y: 0, src1_shape: 0, src1_radius: 64,
+                src2_x: 0, src2_y: 0, src2_shape: 0, src2_radius: 64,
+                src3_x: 0, src3_y: 0, src3_shape: 0, src3_radius: 64,
+                src4_x: 0, src4_y: 0, src4_shape: 0, src4_radius: 64,
+                src5_x: 0, src5_y: 0, src5_shape: 0, src5_radius: 64,
+                src6_x: 0, src6_y: 0, src6_shape: 0, src6_radius: 64,
+                src7_x: 0, src7_y: 0, src7_shape: 0, src7_radius: 64,
             }
         }
 
@@ -1060,23 +1237,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 return Self::disabled();
             }
 
-            // Get up to 8 sources
-            let get_src = |i: usize| -> (u32, u32) {
+            // Get up to 8 sources with position, shape, and radius
+            let get_src = |i: usize| -> (u32, u32, u32, u32) {
                 if i < config.sources.len() {
-                    (config.sources[i].x as u32, config.sources[i].y as u32)
+                    let s = &config.sources[i];
+                    (s.x as u32, s.y as u32, s.shape.to_gpu_id(), s.radius as u32)
                 } else {
-                    (0, 0)
+                    (0, 0, 0, 64)
                 }
             };
 
-            let (src0_x, src0_y) = get_src(0);
-            let (src1_x, src1_y) = get_src(1);
-            let (src2_x, src2_y) = get_src(2);
-            let (src3_x, src3_y) = get_src(3);
-            let (src4_x, src4_y) = get_src(4);
-            let (src5_x, src5_y) = get_src(5);
-            let (src6_x, src6_y) = get_src(6);
-            let (src7_x, src7_y) = get_src(7);
+            let (src0_x, src0_y, src0_shape, src0_radius) = get_src(0);
+            let (src1_x, src1_y, src1_shape, src1_radius) = get_src(1);
+            let (src2_x, src2_y, src2_shape, src2_radius) = get_src(2);
+            let (src3_x, src3_y, src3_shape, src3_radius) = get_src(3);
+            let (src4_x, src4_y, src4_shape, src4_radius) = get_src(4);
+            let (src5_x, src5_y, src5_shape, src5_radius) = get_src(5);
+            let (src6_x, src6_y, src6_shape, src6_radius) = get_src(6);
+            let (src7_x, src7_y, src7_shape, src7_radius) = get_src(7);
 
             Self {
                 enabled: 1,
@@ -1084,15 +1262,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 radius: config.sources.get(0).map(|s| s.radius).unwrap_or(64) as u32,
                 reserve_duration: config.reserve_duration as u32,
                 death_timer: config.interaction_death as u32,
-                _pad: 0,
-                src0_x, src0_y,
-                src1_x, src1_y,
-                src2_x, src2_y,
-                src3_x, src3_y,
-                src4_x, src4_y,
-                src5_x, src5_y,
-                src6_x, src6_y,
-                src7_x, src7_y,
+                spontaneous_rate: config.spontaneous_rate,
+                src0_x, src0_y, src0_shape, src0_radius,
+                src1_x, src1_y, src1_shape, src1_radius,
+                src2_x, src2_y, src2_shape, src2_radius,
+                src3_x, src3_y, src3_shape, src3_radius,
+                src4_x, src4_y, src4_shape, src4_radius,
+                src5_x, src5_y, src5_shape, src5_radius,
+                src6_x, src6_y, src6_shape, src6_radius,
+                src7_x, src7_y, src7_shape, src7_radius,
             }
         }
     }
@@ -1547,11 +1725,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         num_programs: usize,
         num_pairs: usize,
         grid_width: usize,
+        grid_height: usize,
         steps_per_run: u32,
         mutation_prob: u32,
         base_seed: u64,
         epoch: u64,
         energy_params: EnergyParams,
+        // Mega-simulation mode
+        mega_mode: bool,
     }
 
     impl MultiWgpuSimulation {
@@ -1637,6 +1818,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let total_soup_size = soup_size_per_sim * num_sims as u64;
             let energy_size_per_sim = (num_programs * 4) as u64;
             let total_energy_size = energy_size_per_sim * num_sims as u64;
+            
+            // In mega mode, pairs can span all sims, so allocate for worst case
+            let max_pairs = (num_programs * num_sims / 2) + (grid_width + grid_height) * num_sims;
 
             // Single concatenated soup buffer for all simulations
             let soup_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1656,7 +1840,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             let pairs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Pairs"),
-                size: (num_pairs * 2 * 4) as u64,
+                size: (max_pairs * 2 * 4) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -1800,16 +1984,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 num_programs,
                 num_pairs,
                 grid_width,
+                grid_height,
                 steps_per_run,
                 mutation_prob,
                 base_seed,
                 epoch: 0,
                 energy_params,
+                mega_mode: false,
             })
         }
 
         pub fn num_sims(&self) -> usize {
             self.num_sims
+        }
+
+        /// Enable mega-simulation mode (pairs use absolute indices)
+        pub fn set_mega_mode(&mut self, enabled: bool) {
+            self.mega_mode = enabled;
+        }
+
+        /// Set pairs for mega mode (absolute indices including cross-sim pairs)
+        pub fn set_pairs_mega(&mut self, pairs: &[(u32, u32)]) {
+            let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+            self.queue.write_buffer(&self.pairs_buffer, 0, bytemuck::cast_slice(&flat));
+            self.num_pairs = pairs.len();
         }
 
         /// Initialize all simulations with random data
@@ -1839,7 +2037,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         /// Run one epoch on ALL simulations in a SINGLE dispatch
         pub fn run_epoch_all(&mut self) -> u64 {
-            // Update params once (shared by all sims, sim_idx differentiates via global_id.y)
+            // In mega mode: all pairs in x dimension, y=1
+            // In normal mode: pairs in x, simulations in y
+            let (dispatch_x, dispatch_y) = if self.mega_mode {
+                // Mega mode: all pairs processed via x dimension
+                (((self.num_pairs + 255) / 256) as u32, 1u32)
+            } else {
+                // Normal batched mode
+                (((self.num_pairs + 255) / 256) as u32, self.num_sims as u32)
+            };
+            
             let params = BatchedParams {
                 num_pairs: self.num_pairs as u32,
                 steps_per_run: self.steps_per_run,
@@ -1851,7 +2058,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 epoch_hi: (self.epoch >> 32) as u32,
                 num_programs: self.num_programs as u32,
                 num_sims: self.num_sims as u32,
-                _pad0: 0,
+                mega_mode: if self.mega_mode { 1 } else { 0 },
                 _pad1: 0,
             };
             self.queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
@@ -1868,21 +2075,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                // dispatch_workgroups(x, y, z) where:
-                // x = ceil(num_pairs / 256) - handles pairs
-                // y = num_sims - handles simulations
-                pass.dispatch_workgroups(
-                    ((self.num_pairs + 255) / 256) as u32,
-                    self.num_sims as u32,
-                    1
-                );
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             self.queue.submit(Some(encoder.finish()));
             self.device.poll(wgpu::Maintain::Wait);
 
             self.epoch += 1;
-            (self.num_pairs * self.steps_per_run as usize * self.num_sims) as u64
+            
+            // In mega mode, we process all pairs once; in normal mode, each sim processes its pairs
+            let ops_multiplier = if self.mega_mode { 1 } else { self.num_sims };
+            (self.num_pairs * self.steps_per_run as usize * ops_multiplier) as u64
         }
 
         /// Update energy config
@@ -1918,6 +2121,97 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         /// Get epoch count
         pub fn epoch(&self) -> u64 {
             self.epoch
+        }
+
+        /// Set epoch (for resuming from checkpoint)
+        pub fn set_epoch(&mut self, epoch: u64) {
+            self.epoch = epoch;
+        }
+
+        /// Get all soup data from all simulations (for checkpointing)
+        pub fn get_all_soup(&self) -> Vec<u8> {
+            let total_size = self.num_programs * 64 * self.num_sims;
+            
+            // Create a larger staging buffer if needed
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Checkpoint Staging"),
+                size: total_size as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(&self.soup_buffer, 0, &staging, 0, total_size as u64);
+            self.queue.submit(Some(encoder.finish()));
+            
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            
+            let data = slice.get_mapped_range();
+            let result = data.to_vec();
+            drop(data);
+            staging.unmap();
+            result
+        }
+
+        /// Get all energy states from all simulations (for checkpointing)
+        pub fn get_all_energy_states(&self) -> Vec<u32> {
+            let total_size = self.num_programs * self.num_sims * 4; // u32 per program
+            
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Energy Staging"),
+                size: total_size as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(&self.energy_state_buffer, 0, &staging, 0, total_size as u64);
+            self.queue.submit(Some(encoder.finish()));
+            
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            
+            let data = slice.get_mapped_range();
+            let result: Vec<u32> = data.chunks(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            drop(data);
+            staging.unmap();
+            result
+        }
+
+        /// Restore soup data from checkpoint
+        pub fn set_all_soup(&self, soup: &[u8]) {
+            self.queue.write_buffer(&self.soup_buffer, 0, soup);
+        }
+
+        /// Restore energy states from checkpoint
+        pub fn set_all_energy_states(&self, energy_states: &[u32]) {
+            let bytes: Vec<u8> = energy_states.iter()
+                .flat_map(|&e| e.to_le_bytes())
+                .collect();
+            self.queue.write_buffer(&self.energy_state_buffer, 0, &bytes);
+        }
+
+        /// Get grid width
+        pub fn grid_width(&self) -> usize {
+            self.grid_width
+        }
+
+        /// Get number of programs per simulation
+        pub fn num_programs(&self) -> usize {
+            self.num_programs
         }
     }
 }
