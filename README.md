@@ -67,7 +67,7 @@ For NVIDIA GPUs, CUDA is recommended as it has no buffer size limits and is typi
 ## Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/modularflow/energetic-primordial-soup.git
 cd energetic-primordial-soup
 
 # For NVIDIA GPUs (recommended - fastest, no buffer limits)
