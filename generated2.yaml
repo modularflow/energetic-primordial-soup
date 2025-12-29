@@ -6,17 +6,11 @@
 #
 # Or use run_sim.sh: CONFIG_FILE=config.yaml ./run_sim.sh
 
-# Compute backend
-# Options: "cuda" (fastest, NVIDIA only, no buffer limit)
-#          "wgpu" (cross-platform GPU via Vulkan/Metal, 4GB limit)
-#          "cpu"  (fallback, slow but always works)
-backend: "cuda"
-
 # Grid dimensions
 # The simulation runs on a 2D toroidal grid
 grid:
-  width: 1024      # Grid width in programs
-  height: 1024     # Grid height in programs
+  width: 256      # Grid width in programs
+  height: 256     # Grid height in programs
 
 # Core simulation parameters
 simulation:
@@ -34,7 +28,7 @@ simulation:
 # NOTE: If using run.sh, it overrides frames_dir by default. 
 #       Set USE_CONFIG_DIRS=true ./run.sh to use these paths instead.
 output:
-  frame_interval: 256      # Save frame every N epochs (0 = disabled)
+  frame_interval: 8192      # Save frame every N epochs (0 = disabled)
   frames_dir: "frames"     # Output directory for frames (relative or absolute path)
   frame_format: "png"      # "png" (compressed, ~10x smaller) or "ppm" (uncompressed, fast)
   thumbnail_scale: 4       # Downscale factor for regular frames (1 = full size, 4 = 1/4 size)
@@ -59,8 +53,8 @@ energy:
   sources: 6             # Initial number of sources (1-8)
                           # 4=corners, 5=+center, 6=+edges, 8=all
   radius: 64              # Radius of each energy source
-  reserve_epochs: 50000       # Energy reserve when leaving zone
-  death_epochs: 10000       # Epochs without interaction until death (0 = infinite/never)
+  reserve_epochs: 200       # Energy reserve when leaving zone (max 255)
+  death_epochs: 250         # Epochs without interaction until death (max 255)
   spontaneous_rate: 10     # 1 in N chance for dead tape in energy zone to spawn new random program (0 = disabled)
   shape: "random"         # Shape of energy zones: "circle", "strip_h", "strip_v", 
                           # "half_circle", "half_circle_bottom", "half_circle_left", "half_circle_right",
@@ -71,23 +65,8 @@ energy:
   dynamic:
     random_placement: true   # Randomize source positions
     max_sources: 10            # Maximum simultaneous sources
-    source_lifetime: 10000       # Epochs until source expires (0 = infinite)
-    spawn_rate: 5000             # Spawn new source every N epochs (0 = disabled)
-
-  # Per-Simulation Groups (optional)
-  # Run different death_epochs across simulations in a single run.
-  # Each group specifies: death_epochs (required), count (optional), reserve_epochs (optional)
-  # If count is omitted, remaining sims are split evenly across groups without count.
-  # If sim_groups is empty or omitted, all sims use the global death_epochs value above.
-  #
-  # Example: 3 groups with different death timeouts across 256 parallel sims:
-  sim_groups:
-    - death_epochs: 10000    # 85 sims die after 10k epochs without interaction
-      count: 85
-    - death_epochs: 100000   # 85 sims die after 100k epochs
-      count: 85
-    - death_epochs: 0        # 86 sims are immortal (never die from timeout)
-      count: 86
+    source_lifetime: 0       # Epochs until source expires (0 = infinite)
+    spawn_rate: 0             # Spawn new source every N epochs (0 = disabled)
 
 # =============================================
 # EXAMPLE CONFIGURATIONS

@@ -11,6 +11,11 @@
 //! - Copy operations transfer energy to recipients
 //! - Sources can have lifetimes and spawn dynamically
 //! - Dead tapes in energy zones can spontaneously generate new programs
+//!
+//! Note: GPU backends reimplement energy logic in shaders. CPU functions
+//! here are kept for the CPU backend and testing.
+
+#![allow(dead_code)]
 
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
@@ -196,9 +201,9 @@ pub struct EnergyConfig {
     /// List of energy sources
     pub sources: Vec<EnergySource>,
     /// Reserve epochs granted when leaving an energy zone (default: 5)
-    pub reserve_duration: u8,
-    /// Epochs without interaction before death (default: 10)
-    pub interaction_death: u8,
+    pub reserve_duration: u32,
+    /// Epochs without interaction before death (default: 10, 0 = infinite/never)
+    pub interaction_death: u32,
     /// Default radius for new sources
     pub default_radius: usize,
     /// Default shape for sources ("circle", "random", etc)
@@ -254,8 +259,8 @@ impl EnergyConfig {
         height: usize,
         radius: usize,
         count: usize,
-        reserve_duration: u8,
-        interaction_death: u8,
+        reserve_duration: u32,
+        interaction_death: u32,
     ) -> Self {
         Self::with_sources_and_shape(width, height, radius, count, reserve_duration, interaction_death, EnergyShape::Circle)
     }
@@ -266,8 +271,8 @@ impl EnergyConfig {
         height: usize,
         radius: usize,
         count: usize,
-        reserve_duration: u8,
-        interaction_death: u8,
+        reserve_duration: u32,
+        interaction_death: u32,
         shape: EnergyShape,
     ) -> Self {
         let r = radius;
@@ -365,8 +370,8 @@ impl EnergyConfig {
         height: usize,
         radius: usize,
         count: usize,
-        reserve_duration: u8,
-        interaction_death: u8,
+        reserve_duration: u32,
+        interaction_death: u32,
         random_placement: bool,
         max_sources: usize,
         source_lifetime: usize,
@@ -386,8 +391,8 @@ impl EnergyConfig {
         height: usize,
         radius: usize,
         count: usize,
-        reserve_duration: u8,
-        interaction_death: u8,
+        reserve_duration: u32,
+        interaction_death: u32,
         random_placement: bool,
         max_sources: usize,
         source_lifetime: usize,
@@ -454,7 +459,7 @@ impl EnergyConfig {
     }
 
     /// Create a custom configuration
-    pub fn custom(sources: Vec<EnergySource>, reserve_duration: u8, interaction_death: u8) -> Self {
+    pub fn custom(sources: Vec<EnergySource>, reserve_duration: u32, interaction_death: u32) -> Self {
         Self {
             enabled: true,
             sources,
@@ -557,9 +562,9 @@ impl EnergyConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ProgramEnergy {
     /// Reserve energy epochs remaining (0 = no reserve)
-    pub reserve_epochs: u8,
+    pub reserve_epochs: u32,
     /// Epochs since last copy interaction
-    pub epochs_since_interaction: u8,
+    pub epochs_since_interaction: u32,
     /// Whether this program's tape is dead (zeroed)
     pub is_dead: bool,
     /// Whether this program was in an energy zone last epoch
@@ -598,7 +603,7 @@ impl ProgramEnergy {
     /// - If copier is in zone, recipient gets max reserve
     /// - If copier is outside zone, recipient gets copier's remaining reserve
     /// - Resets interaction timer and marks as alive
-    pub fn inherit_energy(&mut self, copier_reserve: u8, copier_in_zone: bool, max_reserve: u8) {
+    pub fn inherit_energy(&mut self, copier_reserve: u32, copier_in_zone: bool, max_reserve: u32) {
         self.is_dead = false;
         self.epochs_since_interaction = 0;
         self.reserve_epochs = if copier_in_zone {
@@ -642,8 +647,8 @@ impl ProgramEnergy {
         if !self.is_dead {
             self.epochs_since_interaction = self.epochs_since_interaction.saturating_add(1);
 
-            // Check for death
-            if self.epochs_since_interaction > config.interaction_death {
+            // Check for death (interaction_death = 0 means infinite, never dies from timeout)
+            if config.interaction_death > 0 && self.epochs_since_interaction > config.interaction_death {
                 self.is_dead = true;
                 return true; // Signal that tape should be zeroed
             }
@@ -659,7 +664,7 @@ impl ProgramEnergy {
     }
 
     /// Revive from death (called when receiving a copy)
-    pub fn revive(&mut self, reserve: u8) {
+    pub fn revive(&mut self, reserve: u32) {
         self.is_dead = false;
         self.reserve_epochs = reserve;
         self.epochs_since_interaction = 0;

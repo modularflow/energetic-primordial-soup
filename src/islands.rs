@@ -1,15 +1,18 @@
 //! Island Model Simulation
-//! 
+//!
 //! Run multiple populations ("islands") in parallel, each with potentially
 //! different parameters and fitness functions. Periodically migrate programs
 //! between islands based on fitness.
+//!
+//! NOTE: This module is not currently used by the main simulation but is kept
+//! for potential future use or experimentation.
+
+#![allow(dead_code)]
 
 use crate::bff::SINGLE_TAPE_SIZE;
 use crate::fitness::{self, FitnessFn};
 use crate::simulation::{Simulation, SimulationParams, Topology};
 use rand::prelude::*;
-use std::sync::{Arc, Mutex};
-use std::thread;
 
 /// Configuration for a single island
 #[derive(Clone)]

@@ -1,5 +1,7 @@
 mod bff;
 mod checkpoint;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod energy;
 mod fitness;
 mod gpu;
@@ -109,14 +111,31 @@ pub struct EnergySettings {
     pub enabled: bool,
     pub sources: usize,
     pub radius: usize,
-    pub reserve_epochs: u8,
-    pub death_epochs: u8,
+    pub reserve_epochs: u32,
+    pub death_epochs: u32,  // 0 = infinite (never dies from timeout)
     /// Spontaneous generation rate (1 in N chance per dead tape in energy zone per epoch, 0 = disabled)
     pub spontaneous_rate: u32,
     /// Shape of energy zones: "circle", "strip_h", "strip_v", "half_circle", "ellipse", "random"
     pub shape: String,
     /// Dynamic energy options
     pub dynamic: DynamicEnergySettings,
+    /// Per-simulation group configs (optional - allows different death_epochs per sim)
+    /// If empty, all sims use the global death_epochs and reserve_epochs values
+    #[serde(default)]
+    pub sim_groups: Vec<SimGroupConfig>,
+}
+
+/// Configuration for a group of simulations with shared energy parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimGroupConfig {
+    /// Number of simulations in this group (if not specified, remaining sims are split evenly)
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Death timer for this group (0 = infinite)
+    pub death_epochs: u32,
+    /// Reserve duration for this group (if not specified, uses global value)
+    #[serde(default)]
+    pub reserve_epochs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +208,67 @@ impl Default for EnergySettings {
             spontaneous_rate: 0,  // Disabled by default
             shape: "circle".to_string(),
             dynamic: DynamicEnergySettings::default(),
+            sim_groups: Vec::new(),  // Empty = all sims use global values
         }
+    }
+}
+
+impl EnergySettings {
+    /// Expand sim_groups into per-simulation configs (death_timer, reserve_duration pairs)
+    /// Returns a Vec of (death_timer, reserve_duration) for each simulation
+    pub fn expand_sim_configs(&self, num_sims: usize) -> Vec<(u32, u32)> {
+        if self.sim_groups.is_empty() {
+            // No groups defined - all sims use global values
+            return vec![(self.death_epochs, self.reserve_epochs); num_sims];
+        }
+        
+        let mut configs = Vec::with_capacity(num_sims);
+        let mut remaining_sims = num_sims;
+        
+        // First pass: count sims with explicit counts
+        let explicit_count: usize = self.sim_groups.iter()
+            .filter_map(|g| g.count)
+            .sum();
+        
+        // Groups without explicit counts split the remaining sims evenly
+        let groups_without_count = self.sim_groups.iter()
+            .filter(|g| g.count.is_none())
+            .count();
+        
+        let remaining_after_explicit = num_sims.saturating_sub(explicit_count);
+        let per_group_default = if groups_without_count > 0 {
+            remaining_after_explicit / groups_without_count
+        } else {
+            0
+        };
+        let mut extra = if groups_without_count > 0 {
+            remaining_after_explicit % groups_without_count
+        } else {
+            0
+        };
+        
+        for group in &self.sim_groups {
+            let count = match group.count {
+                Some(c) => c.min(remaining_sims),
+                None => {
+                    let c = per_group_default + if extra > 0 { extra = extra.saturating_sub(1); 1 } else { 0 };
+                    c.min(remaining_sims)
+                }
+            };
+            
+            let reserve = group.reserve_epochs.unwrap_or(self.reserve_epochs);
+            for _ in 0..count {
+                configs.push((group.death_epochs, reserve));
+            }
+            remaining_sims = remaining_sims.saturating_sub(count);
+        }
+        
+        // Fill any remaining sims with global defaults
+        while configs.len() < num_sims {
+            configs.push((self.death_epochs, self.reserve_epochs));
+        }
+        
+        configs
     }
 }
 
@@ -244,6 +323,8 @@ impl Config {
 }
 
 /// Command-line arguments (internal, maps from Config)
+/// Note: Some fields are only used with specific feature flags (cuda vs wgpu)
+#[allow(dead_code)]
 struct Args {
     grid_width: usize,
     grid_height: usize,
@@ -277,8 +358,8 @@ struct Args {
     energy_enabled: bool,
     energy_sources: usize,
     energy_radius: usize,
-    energy_reserve: u8,
-    energy_death: u8,
+    energy_reserve: u32,
+    energy_death: u32,  // 0 = infinite (never dies from timeout)
     energy_spontaneous_rate: u32,
     energy_shape: String,
     // Dynamic energy options
@@ -286,6 +367,8 @@ struct Args {
     energy_max_sources: usize,
     energy_source_lifetime: usize,
     energy_spawn_rate: usize,
+    // Per-simulation energy configs (for running different death_epochs in same run)
+    energy_sim_groups: Vec<SimGroupConfig>,
 }
 
 impl Default for Args {
@@ -331,6 +414,8 @@ impl Default for Args {
             energy_max_sources: 8,
             energy_source_lifetime: 0,  // 0 = infinite
             energy_spawn_rate: 0,       // 0 = disabled
+            // Per-sim configs
+            energy_sim_groups: Vec::new(),
         }
     }
 }
@@ -373,6 +458,7 @@ impl From<Config> for Args {
             energy_max_sources: c.energy.dynamic.max_sources,
             energy_source_lifetime: c.energy.dynamic.source_lifetime,
             energy_spawn_rate: c.energy.dynamic.spawn_rate,
+            energy_sim_groups: c.energy.sim_groups.clone(),
         }
     }
 }
@@ -404,7 +490,7 @@ fn parse_args() -> Args {
                 let output_path = if i < argv.len() && !argv[i].starts_with('-') {
                     argv[i].clone()
                 } else {
-                    i -= 1; // didn't consume an arg
+                    // No argument provided, use default
                     "config.yaml".to_string()
                 };
                 match Config::write_template(&output_path) {
@@ -639,6 +725,7 @@ fn main() {
     
     let num_programs = args.grid_width * args.grid_height;
     let save_frames = args.frame_interval > 0 && args.render_frames;
+    #[allow(unused_variables)]
     let save_raw = args.save_raw && args.frame_interval > 0;
     
     println!("BFF Primordial Soup Simulation");
@@ -690,32 +777,148 @@ fn main() {
         }
     }
     
-    // Try GPU first, fall back to CPU
-    #[cfg(feature = "wgpu-compute")]
+    // Build energy config for GPU backends
+    #[allow(unused_variables)]
+    let gpu_energy_config = if args.energy_enabled {
+        Some(energy::EnergyConfig::full_with_options(
+            args.grid_width,
+            args.grid_height,
+            args.energy_radius,
+            args.energy_sources,
+            args.energy_reserve,
+            args.energy_death,
+            args.energy_random,
+            args.energy_max_sources,
+            args.energy_source_lifetime,
+            args.energy_spawn_rate,
+            args.seed,
+            args.energy_spontaneous_rate,
+            args.energy_shape.clone(),
+        ))
+    } else {
+        None
+    };
+    
+    // Build per-sim configs if sim_groups specified
+    #[allow(unused_variables)]
+    let per_sim_configs: Option<Vec<(u32, u32)>> = if !args.energy_sim_groups.is_empty() {
+        let energy_settings = EnergySettings {
+            enabled: args.energy_enabled,
+            sources: args.energy_sources,
+            radius: args.energy_radius,
+            reserve_epochs: args.energy_reserve,
+            death_epochs: args.energy_death,
+            spontaneous_rate: args.energy_spontaneous_rate,
+            shape: args.energy_shape.clone(),
+            dynamic: DynamicEnergySettings::default(),
+            sim_groups: args.energy_sim_groups.clone(),
+        };
+        let configs = energy_settings.expand_sim_configs(args.parallel_sims);
+        println!("  Per-sim energy configs: {} groups across {} sims", 
+            args.energy_sim_groups.len(), args.parallel_sims);
+        for (i, group) in args.energy_sim_groups.iter().enumerate() {
+            let count_str = group.count.map(|c| format!("{}", c)).unwrap_or("auto".to_string());
+            let death_str = if group.death_epochs == 0 { "infinite".to_string() } else { format!("{}", group.death_epochs) };
+            println!("    Group {}: {} sims, death_epochs={}", i, count_str, death_str);
+        }
+        
+        // Write sim_groups.txt
+        if let Err(e) = std::fs::create_dir_all(&args.frames_dir) {
+            eprintln!("Warning: Could not create frames directory: {}", e);
+        } else {
+            let groups_file = format!("{}/sim_groups.txt", args.frames_dir);
+            let mut content = String::new();
+            content.push_str("# Simulation Group Configuration\n");
+            content.push_str("# Generated at run start\n");
+            content.push_str(&format!("# Total simulations: {}\n\n", args.parallel_sims));
+            
+            let mut sim_idx = 0usize;
+            for (i, group) in args.energy_sim_groups.iter().enumerate() {
+                let count = group.count.unwrap_or_else(|| {
+                    let explicit: usize = args.energy_sim_groups.iter().filter_map(|g| g.count).sum();
+                    let remaining = args.parallel_sims.saturating_sub(explicit);
+                    let without_count = args.energy_sim_groups.iter().filter(|g| g.count.is_none()).count();
+                    remaining / without_count.max(1)
+                });
+                let death_str = if group.death_epochs == 0 { 
+                    "infinite (never dies from timeout)".to_string() 
+                } else { 
+                    format!("{} epochs", group.death_epochs) 
+                };
+                let reserve = group.reserve_epochs.unwrap_or(args.energy_reserve);
+                
+                content.push_str(&format!("## Group {} - death_epochs: {}\n", i, death_str));
+                content.push_str(&format!("   reserve_epochs: {}\n", reserve));
+                content.push_str(&format!("   sim_{} to sim_{}\n\n", sim_idx, sim_idx + count.saturating_sub(1)));
+                sim_idx += count;
+            }
+            
+            if sim_idx < args.parallel_sims {
+                let death_str = if args.energy_death == 0 {
+                    "infinite (never dies from timeout)".to_string()
+                } else {
+                    format!("{} epochs", args.energy_death)
+                };
+                content.push_str(&format!("## Remaining (global defaults) - death_epochs: {}\n", death_str));
+                content.push_str(&format!("   reserve_epochs: {}\n", args.energy_reserve));
+                content.push_str(&format!("   sim_{} to sim_{}\n", sim_idx, args.parallel_sims - 1));
+            }
+            
+            if let Err(e) = std::fs::write(&groups_file, &content) {
+                eprintln!("Warning: Could not write sim_groups.txt: {}", e);
+            } else {
+                println!("  Wrote group config to: {}", groups_file);
+            }
+        }
+        
+        Some(configs)
+    } else {
+        None
+    };
+    
+    // Try CUDA first (no 4GB buffer limit)
+    #[cfg(feature = "cuda")]
     {
-        // Build energy config for GPU
-        let gpu_energy_config = if args.energy_enabled {
-            Some(energy::EnergyConfig::full_with_options(
+        if args.parallel_sims > 1 && cuda::cuda_available() {
+            println!("\n  Backend: CUDA (no buffer size limit)\n");
+            
+            match cuda::CudaMultiSimulation::new(
+                args.parallel_sims,
+                num_programs,
                 args.grid_width,
                 args.grid_height,
-                args.energy_radius,
-                args.energy_sources,
-                args.energy_reserve,
-                args.energy_death,
-                args.energy_random,
-                args.energy_max_sources,
-                args.energy_source_lifetime,
-                args.energy_spawn_rate,
                 args.seed,
-                args.energy_spontaneous_rate,
-                args.energy_shape.clone(),
-            ))
-        } else {
-            None
-        };
-        
+                args.mutation_prob,
+                args.steps_per_run as u32,
+                gpu_energy_config.as_ref(),
+                per_sim_configs.clone(),
+            ) {
+                Ok(mut cuda_sim) => {
+                    // Run CUDA simulation
+                    run_cuda_simulation(
+                        &mut cuda_sim,
+                        args.max_epochs,
+                        &args.frames_dir,
+                        save_frames,
+                        args.frame_interval,
+                        &args.frame_format,
+                        args.thumbnail_scale,
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("CUDA initialization failed: {}", e);
+                    println!("Falling back to wgpu...");
+                }
+            }
+        }
+    }
+    
+    // Try wgpu (cross-platform, 4GB buffer limit)
+    #[cfg(feature = "wgpu-compute")]
+    {
         if args.parallel_sims > 1 {
-            // Multi-simulation mode
+            // Multi-simulation mode (gpu_energy_config and per_sim_configs already built above)
             if let Some(mut multi_sim) = gpu::wgpu_sim::MultiWgpuSimulation::new(
                 args.parallel_sims,
                 num_programs,
@@ -725,6 +928,7 @@ fn main() {
                 args.mutation_prob,
                 args.steps_per_run as u32,
                 gpu_energy_config.as_ref(),
+                per_sim_configs,
             ) {
                 let mode_desc = if args.border_interaction {
                     format!("mega-sim ({}x{} grid)", args.parallel_layout[0], args.parallel_layout[1])
@@ -835,8 +1039,8 @@ fn run_cpu_simulation(
     energy_enabled: bool,
     energy_sources: usize,
     energy_radius: usize,
-    energy_reserve: u8,
-    energy_death: u8,
+    energy_reserve: u32,
+    energy_death: u32,  // 0 = infinite (never dies from timeout)
     energy_spontaneous_rate: u32,
     energy_shape: &str,
     energy_random: bool,
@@ -922,6 +1126,74 @@ fn run_cpu_simulation(
     }
     
     println!("\nSimulation complete!");
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda_simulation(
+    cuda_sim: &mut cuda::CudaMultiSimulation,
+    max_epochs: usize,
+    frames_dir: &str,
+    save_frames: bool,
+    frame_interval: usize,
+    frame_format: &str,
+    thumbnail_scale: usize,
+) {
+    use std::time::Instant;
+    
+    let num_sims = cuda_sim.num_sims();
+    let num_programs = cuda_sim.num_programs();
+    let grid_width = cuda_sim.grid_width();
+    let grid_height = cuda_sim.grid_height();
+    
+    // Create output directories
+    if save_frames {
+        std::fs::create_dir_all(frames_dir).ok();
+        for sim_idx in 0..num_sims {
+            std::fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx)).ok();
+        }
+    }
+    
+    let start_time = Instant::now();
+    let mut total_ops: u64 = 0;
+    let mut last_print = Instant::now();
+    
+    println!("Running {} epochs across {} simulations...", max_epochs, num_sims);
+    
+    for epoch in 0..max_epochs {
+        let ops = cuda_sim.step();
+        total_ops += ops;
+        
+        // Save frames
+        if save_frames && frame_interval > 0 && epoch % frame_interval == 0 {
+            let all_soup = cuda_sim.get_all_soup();
+            
+            for sim_idx in 0..num_sims {
+                let sim_offset = sim_idx * num_programs * 64;
+                let sim_soup = &all_soup[sim_offset..sim_offset + num_programs * 64];
+                
+                let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
+                save_frame(sim_soup, grid_width, grid_height, &sim_frames_dir, epoch, frame_format, thumbnail_scale).ok();
+            }
+        }
+        
+        // Progress update every second
+        if last_print.elapsed().as_secs() >= 1 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let epochs_per_sec = (epoch + 1) as f64 / elapsed;
+            let ops_per_sec = total_ops as f64 / elapsed;
+            let remaining = (max_epochs - epoch - 1) as f64 / epochs_per_sec;
+            
+            print!("\rEpoch {}/{} | {:.1} epochs/s | {:.2}B ops/s | ETA: {:.0}s    ",
+                epoch + 1, max_epochs, epochs_per_sec, ops_per_sec / 1e9, remaining);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            last_print = Instant::now();
+        }
+    }
+    
+    println!("\n\nCUDA simulation complete!");
+    println!("  Total epochs: {}", max_epochs);
+    println!("  Total ops: {:.2}B", total_ops as f64 / 1e9);
+    println!("  Elapsed: {:.1}s", start_time.elapsed().as_secs_f64());
 }
 
 #[cfg(feature = "wgpu-compute")]
@@ -1370,6 +1642,7 @@ fn run_gpu_simulation(
 }
 
 /// Generate pairs for 2D grid topology
+#[allow(dead_code)]
 fn generate_2d_pairs(
     num_programs: usize,
     width: usize,
@@ -1786,6 +2059,7 @@ fn save_mega_frame_from_data(
 }
 
 /// Format a Unix timestamp as a human-readable string
+#[allow(dead_code)]
 fn chrono_time_str(timestamp: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
@@ -1919,6 +2193,7 @@ fn save_ppm(
 }
 
 /// Legacy function for backwards compatibility
+#[allow(dead_code)]
 fn save_ppm_frame(
     soup: &[u8],
     grid_width: usize,
@@ -1962,6 +2237,7 @@ fn init_byte_colors() -> [[u8; 3]; 256] {
 // ============================================================================
 
 /// Message type for async save operations
+#[allow(dead_code)]
 enum SaveMessage {
     /// Save raw soup data
     RawData {
@@ -1978,11 +2254,13 @@ enum SaveMessage {
 }
 
 /// Async writer handle - sends save operations to a background thread
+#[allow(dead_code)]
 struct AsyncWriter {
     sender: Sender<SaveMessage>,
     handle: Option<JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 impl AsyncWriter {
     /// Create a new async writer with a background thread
     fn new() -> Self {
@@ -2033,6 +2311,7 @@ impl AsyncWriter {
 }
 
 /// Save raw soup data to disk (synchronous version) with Zstd compression
+#[allow(dead_code)]
 fn save_raw_data_sync(
     data: &[u8],
     epoch: usize,
@@ -2083,46 +2362,6 @@ struct RawDataHeader {
     grid_height: usize,
     num_sims: usize,
     layout: [usize; 2],
-}
-
-/// Load raw data file header (supports both v1 BFFR and v2 BFF2 formats)
-fn load_raw_header(path: &Path) -> std::io::Result<RawDataHeader> {
-    use std::io::Read;
-    let mut file = File::open(path)?;
-    
-    // Read magic
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic)?;
-    if &magic != b"BFFR" && &magic != b"BFF2" {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid raw data magic"));
-    }
-    
-    // Read version
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf)?;
-    let _version = u32::from_le_bytes(buf);
-    
-    // Read metadata
-    file.read_exact(&mut buf)?;
-    let epoch = u32::from_le_bytes(buf) as usize;
-    file.read_exact(&mut buf)?;
-    let grid_width = u32::from_le_bytes(buf) as usize;
-    file.read_exact(&mut buf)?;
-    let grid_height = u32::from_le_bytes(buf) as usize;
-    file.read_exact(&mut buf)?;
-    let num_sims = u32::from_le_bytes(buf) as usize;
-    file.read_exact(&mut buf)?;
-    let layout_cols = u32::from_le_bytes(buf) as usize;
-    file.read_exact(&mut buf)?;
-    let layout_rows = u32::from_le_bytes(buf) as usize;
-    
-    Ok(RawDataHeader {
-        epoch,
-        grid_width,
-        grid_height,
-        num_sims,
-        layout: [layout_cols, layout_rows],
-    })
 }
 
 /// Load raw data file (header + soup data) - supports both v1 BFFR and v2 BFF2 formats

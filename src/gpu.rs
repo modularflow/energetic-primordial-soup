@@ -1,13 +1,16 @@
-/// GPU-accelerated simulation using CUDA
-/// 
-/// This module provides GPU acceleration for the BFF simulation using cudarc.
-/// The simulation runs entirely on the GPU, with only periodic reads back to CPU
-/// for statistics and visualization.
+//! GPU-accelerated simulation using CUDA and WGPU
+//!
+//! This module provides GPU acceleration for the BFF simulation.
+//! The simulation runs entirely on the GPU, with only periodic reads back to CPU
+//! for statistics and visualization.
+//!
+//! Note: Some functions are kept for API completeness even if not currently used.
+
+#![allow(dead_code)]
 
 #[cfg(feature = "cuda")]
 pub mod cuda {
     use cudarc::driver::*;
-    use cudarc::nvrtc::Ptx;
     use std::sync::Arc;
 
     /// CUDA kernel source for BFF evaluation
@@ -663,8 +666,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     p1_timer += 1u;
                 }
                 
-                // Check death
-                if (p1_timer > energy_params.death_timer && !p1_dead) {
+                // Check death (death_timer = 0 means infinite, never dies from timeout)
+                if (energy_params.death_timer > 0u && p1_timer > energy_params.death_timer && !p1_dead) {
                     p1_dead = true;
                 }
             }
@@ -695,7 +698,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     p2_timer += 1u;
                 }
                 
-                if (p2_timer > energy_params.death_timer && !p2_dead) {
+                // Check death (death_timer = 0 means infinite, never dies from timeout)
+                if (energy_params.death_timer > 0u && p2_timer > energy_params.death_timer && !p2_dead) {
                     p2_dead = true;
                 }
             }
@@ -787,6 +791,17 @@ struct EnergyParams {
 @group(0) @binding(4) var<uniform> energy_params: EnergyParams;
 @group(0) @binding(5) var<storage, read_write> energy_state: array<u32>;
 @group(0) @binding(6) var<storage, read> energy_map: array<u32>;  // Pre-computed energy zone lookup (1 bit per program, packed)
+@group(0) @binding(7) var<storage, read> sim_configs: array<u32>;  // Per-sim configs: [death_timer, reserve_duration] pairs
+
+// Get per-sim death timer (0 = infinite/immortal)
+fn get_sim_death_timer(sim_idx: u32) -> u32 {
+    return sim_configs[sim_idx * 2u];
+}
+
+// Get per-sim reserve duration
+fn get_sim_reserve_duration(sim_idx: u32) -> u32 {
+    return sim_configs[sim_idx * 2u + 1u];
+}
 
 fn lcg(seed: u32) -> u32 {
     return seed * 1664525u + 1013904223u;
@@ -1288,21 +1303,28 @@ fn main(
     var p2_stays_dead = false;
     
     if (energy_params.enabled != 0u) {
+        // Get per-simulation energy configs
+        let p1_death_timer = get_sim_death_timer(p1_sim);
+        let p1_reserve_duration = get_sim_reserve_duration(p1_sim);
+        let p2_death_timer = get_sim_death_timer(p2_sim);
+        let p2_reserve_duration = get_sim_reserve_duration(p2_sim);
+        
         var p1_reserve = get_reserve(p1_state);
         var p1_timer = get_timer(p1_state);
         var p1_dead = p1_was_dead;
         if (p1_in_zone) {
-            p1_reserve = energy_params.reserve_duration;
+            p1_reserve = p1_reserve_duration;
             p1_timer = 0u;
         } else if (p1_received_copy) {
-            let p2_res = select(energy_params.reserve_duration, get_reserve(p2_state), !p2_in_zone);
+            let p2_res = select(p2_reserve_duration, get_reserve(p2_state), !p2_in_zone);
             p1_reserve = p2_res;
             p1_timer = 0u;
             p1_dead = false;
         } else {
             if (p1_reserve > 0u) { p1_reserve -= 1u; }
             if (!p1_dead) { p1_timer += 1u; }
-            if (p1_timer > energy_params.death_timer && !p1_dead) {
+            // death_timer = 0 means infinite (never dies from timeout)
+            if (p1_death_timer > 0u && p1_timer > p1_death_timer && !p1_dead) {
                 p1_dead = true;
             }
         }
@@ -1313,17 +1335,18 @@ fn main(
         var p2_timer = get_timer(p2_state);
         var p2_dead = p2_was_dead;
         if (p2_in_zone) {
-            p2_reserve = energy_params.reserve_duration;
+            p2_reserve = p2_reserve_duration;
             p2_timer = 0u;
         } else if (p2_received_copy) {
-            let p1_res = select(energy_params.reserve_duration, get_reserve(p1_state), !p1_in_zone);
+            let p1_res = select(p1_reserve_duration, get_reserve(p1_state), !p1_in_zone);
             p2_reserve = p1_res;
             p2_timer = 0u;
             p2_dead = false;
         } else {
             if (p2_reserve > 0u) { p2_reserve -= 1u; }
             if (!p2_dead) { p2_timer += 1u; }
-            if (p2_timer > energy_params.death_timer && !p2_dead) {
+            // death_timer = 0 means infinite (never dies from timeout)
+            if (p2_death_timer > 0u && p2_timer > p2_death_timer && !p2_dead) {
                 p2_dead = true;
             }
         }
@@ -1747,7 +1770,7 @@ fn main(
             // Initialize energy state: all programs start alive with full reserve if in zone
             // Format: reserve(8) | timer(8) | dead(8) | unused(8)
             let energy_state: Vec<u32> = (0..self.num_programs)
-                .map(|i| {
+                .map(|_| {
                     // Start with reserve = reserve_duration, timer = 0, dead = false
                     self.energy_params.reserve_duration & 0xFF
                 })
@@ -1906,6 +1929,7 @@ fn main(
         soup_buffer: wgpu::Buffer,        // size = num_programs * 64 * num_sims
         energy_state_buffer: wgpu::Buffer, // size = num_programs * 4 * num_sims
         energy_map_buffer: wgpu::Buffer,  // Pre-computed energy zone bitmask (packed bits)
+        sim_configs_buffer: wgpu::Buffer, // Per-sim energy configs: [death_timer, reserve_duration] pairs
         pairs_buffer: wgpu::Buffer,
         params_buffer: wgpu::Buffer,
         ops_buffer: wgpu::Buffer,
@@ -1934,6 +1958,9 @@ fn main(
 
     impl MultiWgpuSimulation {
         /// Create N simulations with a single dispatch (true SIMD parallelism)
+        /// 
+        /// `per_sim_configs` is an optional Vec of (death_timer, reserve_duration) pairs.
+        /// If None or empty, all sims use the values from energy_config.
         pub fn new(
             num_sims: usize,
             num_programs: usize,
@@ -1943,10 +1970,11 @@ fn main(
             mutation_prob: u32,
             steps_per_run: u32,
             energy_config: Option<&crate::energy::EnergyConfig>,
+            per_sim_configs: Option<Vec<(u32, u32)>>,
         ) -> Option<Self> {
             pollster::block_on(Self::new_async(
                 num_sims, num_programs, grid_width, grid_height, base_seed,
-                mutation_prob, steps_per_run, energy_config
+                mutation_prob, steps_per_run, energy_config, per_sim_configs
             ))
         }
 
@@ -1959,6 +1987,7 @@ fn main(
             mutation_prob: u32,
             steps_per_run: u32,
             energy_config: Option<&crate::energy::EnergyConfig>,
+            per_sim_configs: Option<Vec<(u32, u32)>>,
         ) -> Option<Self> {
             if num_sims == 0 {
                 return None;
@@ -1983,10 +2012,27 @@ fn main(
 
             println!("GPU Adapter: {:?} (batched {} simulations)", adapter.get_info().name, num_sims);
 
-            // Calculate required buffer size for the limits
-            let soup_size_total = (num_programs * 64 * num_sims) as u32;
-            let energy_size_total = (num_programs * 4 * num_sims) as u32;
-            let max_buffer_size = soup_size_total.max(energy_size_total).max(1 << 30); // At least 1GB
+            // Calculate required buffer size for the limits (use u64 to avoid overflow)
+            let soup_size_total: u64 = (num_programs as u64) * 64 * (num_sims as u64);
+            let energy_size_total: u64 = (num_programs as u64) * 4 * (num_sims as u64);
+            let required_buffer_size = soup_size_total.max(energy_size_total);
+            
+            // WebGPU/Vulkan storage buffer binding size is typically limited to 2-4GB
+            // max_storage_buffer_binding_size is u32, so hard cap at ~4GB
+            const MAX_STORAGE_BUFFER: u64 = (1u64 << 32) - 1; // 4GB - 1 byte
+            
+            if required_buffer_size > MAX_STORAGE_BUFFER {
+                let gb = required_buffer_size as f64 / (1024.0 * 1024.0 * 1024.0);
+                eprintln!("ERROR: Simulation too large! Buffer size {:.2} GB exceeds 4GB limit.", gb);
+                eprintln!("  Total programs: {} × {} sims = {}", num_programs, num_sims, num_programs * num_sims);
+                eprintln!("  Try reducing grid size or number of parallel sims.");
+                eprintln!("  Current: {}×{} grid × {} sims", grid_width, grid_height, num_sims);
+                eprintln!("  Max programs for {} sims: ~{}", num_sims, MAX_STORAGE_BUFFER / 64 / num_sims as u64);
+                return None;
+            }
+            
+            // Request the buffer size we need (capped at 4GB for storage binding)
+            let max_buffer_size = (required_buffer_size as u32).max(1 << 30); // At least 1GB
 
             let (device, queue) = adapter
                 .request_device(
@@ -1995,7 +2041,7 @@ fn main(
                         required_features: wgpu::Features::empty(),
                         required_limits: wgpu::Limits {
                             max_storage_buffer_binding_size: max_buffer_size,
-                            max_buffer_size: max_buffer_size as u64,
+                            max_buffer_size: required_buffer_size.max(1 << 30),
                             ..Default::default()
                         },
                     },
@@ -2073,6 +2119,34 @@ fn main(
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
+            // Per-simulation configs buffer: [death_timer, reserve_duration] pairs (2 u32s per sim)
+            // Build the config data - either from per_sim_configs or default to global values
+            let sim_configs_data: Vec<u32> = match per_sim_configs {
+                Some(configs) if !configs.is_empty() => {
+                    // Expand to num_sims, cycling through provided configs if needed
+                    (0..num_sims)
+                        .flat_map(|i| {
+                            let (death, reserve) = configs[i % configs.len()];
+                            [death, reserve]
+                        })
+                        .collect()
+                }
+                _ => {
+                    // Default: all sims use global energy_params values
+                    (0..num_sims)
+                        .flat_map(|_| [energy_params.death_timer, energy_params.reserve_duration])
+                        .collect()
+                }
+            };
+            
+            let sim_configs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("SimConfigs"),
+                size: (num_sims * 2 * 4) as u64,  // 2 u32s per sim
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&sim_configs_buffer, 0, bytemuck::cast_slice(&sim_configs_data));
 
             let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Staging"),
@@ -2169,6 +2243,16 @@ fn main(
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -2197,6 +2281,7 @@ fn main(
                     wgpu::BindGroupEntry { binding: 4, resource: energy_params_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: energy_state_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: energy_map_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: sim_configs_buffer.as_entire_binding() },
                 ],
             });
 
@@ -2215,6 +2300,7 @@ fn main(
                 soup_buffer,
                 energy_state_buffer,
                 energy_map_buffer,
+                sim_configs_buffer,
                 pairs_buffer,
                 params_buffer,
                 ops_buffer,

@@ -1,5 +1,10 @@
-/// BFF - Brainfuck variant with two heads
-/// Matching semantics from cubff/bff.cu
+//! BFF - Brainfuck variant with two heads
+//! Matching semantics from cubff/bff.cu
+//!
+//! Note: The GPU backends implement BFF evaluation in shaders. The CPU
+//! functions here are kept for testing, debugging, and potential CPU-only use.
+
+#![allow(dead_code)]
 
 pub const SINGLE_TAPE_SIZE: usize = 64;
 pub const FULL_TAPE_SIZE: usize = 2 * SINGLE_TAPE_SIZE; // 128 bytes

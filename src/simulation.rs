@@ -1,5 +1,9 @@
-/// Simulation framework matching cubff semantics
-/// Runs an evolutionary "primordial soup" of BFF programs
+//! Simulation framework matching cubff semantics
+//! Runs an evolutionary "primordial soup" of BFF programs
+//!
+//! Note: Some methods are kept for API completeness even if not currently used.
+
+#![allow(dead_code)]
 
 use crate::bff::{self, SINGLE_TAPE_SIZE, FULL_TAPE_SIZE, CrossProgramCopy};
 use crate::energy::{EnergyConfig, EnergySystem, CopyEvent};

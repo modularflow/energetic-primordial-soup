@@ -5,6 +5,10 @@
 //! - Energy states (reserve, timer, dead status per program)
 //! - Current epoch
 //! - Configuration for validation
+//!
+//! Note: Some utility functions are kept for future use even if not currently called.
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};

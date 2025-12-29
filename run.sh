@@ -7,6 +7,12 @@
 #   ./run.sh                     # Uses config.yaml (if exists) or defaults
 #   ./run.sh config.yaml         # Use specific config file
 #   MAX_EPOCHS=5000 ./run.sh     # Override specific values
+#   BACKEND=cuda ./run.sh        # Override backend (cuda/wgpu/cpu)
+#
+# BACKEND SELECTION (in order of priority):
+#   1. BACKEND env var           # BACKEND=cuda ./run.sh
+#   2. config.yaml backend:      # backend: "cuda" in config file
+#   3. Default: wgpu             # Cross-platform GPU via Vulkan/Metal
 #
 # DIRECTORY BEHAVIOR:
 #   With config file: Uses frames_dir and checkpoint.path from config.yaml
@@ -82,8 +88,31 @@ fi
 # ============================================================================
 # BUILD
 # ============================================================================
+# Detect backend from config file, env var, or default to wgpu
+# Priority: BACKEND env var > config file > default (wgpu)
+if [ -n "${BACKEND:-}" ]; then
+    SELECTED_BACKEND="$BACKEND"
+elif [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
+    # Extract backend from config (handles quoted and unquoted values)
+    SELECTED_BACKEND=$(grep -E "^backend:" "$CONFIG_FILE" | head -1 | sed 's/backend:\s*["'\'']\?\([^"'\''#]*\)["'\'']\?.*/\1/' | xargs)
+fi
+SELECTED_BACKEND="${SELECTED_BACKEND:-wgpu}"
+
 echo "Building..."
-cargo build --release --features wgpu-compute 2>&1 | tail -3
+case "$SELECTED_BACKEND" in
+    cuda|CUDA)
+        echo "  Backend: CUDA (NVIDIA GPU, no buffer limit)"
+        PATH="/usr/local/cuda/bin:$PATH" cargo build --release --features cuda 2>&1 | tail -3
+        ;;
+    cpu|CPU)
+        echo "  Backend: CPU (slow fallback)"
+        cargo build --release 2>&1 | tail -3
+        ;;
+    wgpu|WGPU|vulkan|metal|*)
+        echo "  Backend: wgpu/Vulkan (cross-platform GPU)"
+        cargo build --release --features wgpu-compute 2>&1 | tail -3
+        ;;
+esac
 echo ""
 
 # ============================================================================

@@ -1,7 +1,12 @@
 //! Fitness functions for program selection
-//! 
+//!
 //! These functions evaluate programs and return a fitness score.
 //! Higher scores = more likely to survive/migrate.
+//!
+//! NOTE: This module is not currently used by the main simulation but is kept
+//! for potential future use with island models or fitness-based selection.
+
+#![allow(dead_code)]
 
 use crate::bff::SINGLE_TAPE_SIZE;
 

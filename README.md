@@ -35,10 +35,11 @@ The "energy" portion of this implementation is also inspired by research done on
 ## Background
 
 This Rust implementation provides:
-- GPU acceleration via wgpu (Vulkan/Metal backend for accessibility of all GPU brands)
+- GPU acceleration via CUDA (NVIDIA, fastest, no buffer limits) or wgpu (Vulkan/Metal, cross-platform)
 - Batched parallel simulations (run multiple seeds simultaneously)
 - Mega-simulation mode (parallel sims arranged in a grid with cross-border interaction)
 - Configurable energy zones with variable shapes for spatial evolutionary dynamics
+- Simulation groups for comparative experiments with different evolutionary pressures
 - Checkpointing for saving and resuming simulations
 - Async raw data saving for maximum simulation speed
 - Post-simulation frame rendering
@@ -48,15 +49,35 @@ This Rust implementation provides:
 ## Requirements
 
 - Rust 1.70+
-- GPU with Vulkan or Metal support (for GPU acceleration)
+- GPU with Vulkan, Metal, or CUDA support (for GPU acceleration)
 - ffmpeg (for video generation)
+
+### Compute Backends
+
+The simulation supports three compute backends, configurable via the `backend` field in config.yaml:
+
+| Backend | Requirements | Buffer Limit | Performance |
+|---------|--------------|--------------|-------------|
+| `cuda` | NVIDIA GPU + CUDA toolkit | None (full GPU memory) | Fastest |
+| `wgpu` | Any GPU with Vulkan/Metal | 4GB per buffer | Good |
+| `cpu` | None | System RAM | Slow (fallback) |
+
+For NVIDIA GPUs, CUDA is recommended as it has no buffer size limits and is typically faster. For AMD, Intel, or Apple GPUs, wgpu provides cross-platform support via Vulkan or Metal.
 
 ## Installation
 
 ```bash
 git clone <repository-url>
 cd energetic-primordial-soup
+
+# For NVIDIA GPUs (recommended - fastest, no buffer limits)
+cargo build --release --features cuda
+
+# For cross-platform GPU (Vulkan/Metal - works on AMD, Intel, Apple)
 cargo build --release --features wgpu-compute
+
+# For CPU-only (no GPU required, slow)
+cargo build --release
 ```
 
 ## Quick Start
@@ -101,17 +122,23 @@ USE_CONFIG_DIRS=true ./run.sh
 Create a `config.yaml` file to configure the simulation:
 
 ```yaml
+# Compute backend
+# Options: "cuda" (fastest, NVIDIA only, no buffer limit)
+#          "wgpu" (cross-platform GPU via Vulkan/Metal, 4GB limit)
+#          "cpu"  (fallback, slow but always works)
+backend: "cuda"
+
 # Grid dimensions
 grid:
-  width: 256
-  height: 256
+  width: 1024
+  height: 1024
 
 # Core simulation parameters
 simulation:
   seed: 42                      # Random seed for reproducibility
-  mutation_rate: 4096           # 1 in N chance per byte (higher = less mutation)
-  steps_per_run: 8192           # BFF execution steps per epoch
-  max_epochs: 100000            # Total epochs to run
+  mutation_rate: 2048           # 1 in N chance per byte (higher = less mutation)
+  steps_per_run: 4096           # BFF execution steps per epoch
+  max_epochs: 1000000           # Total epochs to run
   neighbor_range: 2             # Pairing range (2 = 5x5 neighborhood)
   auto_terminate_dead_epochs: 0 # Terminate if all dead for N epochs (0=disabled)
   parallel_sims: 256            # Run N simulations in parallel on GPU
@@ -120,21 +147,21 @@ simulation:
 
 # Output settings
 output:
-  frame_interval: 128           # Save every N epochs (0 = disabled)
+  frame_interval: 256           # Save every N epochs (0 = disabled)
   frames_dir: "frames"          # Output directory (relative or absolute)
-  frame_format: "png"           # "png", "jpeg", or "ppm"
+  frame_format: "png"           # "png" (compressed) or "ppm" (uncompressed)
   thumbnail_scale: 4            # Downscale factor (1 = full, 4 = 1/4 size)
   
   # Raw data saving (for post-simulation rendering)
-  save_raw: true                # Save raw soup data (fast binary dumps)
+  save_raw: false               # Save raw soup data (fast binary dumps)
   raw_dir: "raw_data"           # Directory for raw data files
   async_save: true              # Save in background thread (non-blocking)
-  render_frames: false          # Render frames during simulation
+  render_frames: true           # Render frames during simulation
 
 # Checkpoint settings
 checkpoint:
   enabled: true                 # Enable checkpointing
-  interval: 10000               # Save every N epochs (0 = only at end)
+  interval: 50000               # Save every N epochs (0 = only at end)
   path: "checkpoints"           # Directory for checkpoint files
   resume_from: ""               # Path to checkpoint to resume (empty = fresh start)
 
@@ -143,8 +170,8 @@ energy:
   enabled: true
   sources: 6                    # Number of sources (1-8)
   radius: 64                    # Radius of each source
-  reserve_epochs: 50            # Reserve energy when leaving zone
-  death_epochs: 100             # Epochs without interaction until death
+  reserve_epochs: 50000         # Reserve energy when leaving zone
+  death_epochs: 10000           # Epochs without interaction until death (0 = infinite)
   spontaneous_rate: 10          # 1 in N chance for dead tape in zone to respawn (0=disabled)
   shape: "random"               # Shape: circle, strip_h, strip_v, half_circle,
                                 # half_circle_bottom, half_circle_left, half_circle_right,
@@ -156,6 +183,17 @@ energy:
     max_sources: 10             # Maximum simultaneous sources
     source_lifetime: 10000      # Epochs until source expires (0 = infinite)
     spawn_rate: 5000            # Spawn new source every N epochs (0 = disabled)
+
+  # Per-Simulation Groups (optional)
+  # Run different death_epochs across simulations in a single run.
+  # Useful for comparing different evolutionary pressures.
+  sim_groups:
+    - death_epochs: 10000       # 85 sims die after 10k epochs without interaction
+      count: 85
+    - death_epochs: 100000      # 85 sims die after 100k epochs
+      count: 85
+    - death_epochs: 0           # 86 sims are immortal (never die from timeout)
+      count: 86
 ```
 
 ## Energy System
@@ -165,10 +203,11 @@ The energy system adds spatial structure to the simulation:
 - **Energy Sources**: Fixed or randomly placed zones on the grid with configurable shapes
 - **Mutation Permission**: Only programs within energy zones (or with reserve energy) can mutate
 - **Reserve Energy**: Programs leaving an energy zone retain mutation ability for a limited time
-- **Death Timer**: Programs outside energy zones that don't interact for too long become inactive
+- **Death Timer**: Programs outside energy zones that don't interact for too long become inactive (set to 0 for immortal programs)
 - **Dynamic Sources**: Sources can spawn, expire, and move over time
 - **Spontaneous Generation**: Dead tapes within energy zones can randomly spawn new programs
 - **Per-Simulation Variation**: Each parallel simulation gets unique energy field positions
+- **Simulation Groups**: Run different death_epochs across simulations for comparative experiments
 
 ### Energy Zone Shapes
 
@@ -183,6 +222,29 @@ Available shapes for energy zones:
 - `ellipse` - Horizontal ellipse
 - `ellipse_v` - Vertical ellipse
 - `random` - Random shape per source
+
+### Simulation Groups
+
+When running parallel simulations, you can assign different `death_epochs` values to groups of simulations. This enables comparative experiments within a single run:
+
+```yaml
+energy:
+  enabled: true
+  death_epochs: 10000           # Default for sims not in a group
+  
+  # Define groups with different evolutionary pressures
+  sim_groups:
+    - death_epochs: 10000       # Fast death - high pressure
+      count: 85                 # Number of sims in this group
+    - death_epochs: 100000      # Slow death - moderate pressure
+      count: 85
+    - death_epochs: 0           # Immortal - no death pressure
+      count: 86
+```
+
+- If `count` is omitted from a group, remaining simulations are split evenly among groups without explicit counts
+- If `sim_groups` is empty or omitted, all simulations use the global `death_epochs` value
+- A `sim_groups.txt` file is saved to the frames directory documenting which simulations belong to which group
 
 ## Mega-Simulation Mode
 
