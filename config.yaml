@@ -15,8 +15,8 @@ backend: "cuda"
 # Grid dimensions
 # The simulation runs on a 2D toroidal grid
 grid:
-  width: 1024      # Grid width in programs
-  height: 1024     # Grid height in programs
+  width: 256      # Grid width in programs
+  height: 256  # Grid height in programs
 
 # Core simulation parameters
 simulation:
@@ -34,34 +34,34 @@ simulation:
 # NOTE: If using run.sh, it overrides frames_dir by default. 
 #       Set USE_CONFIG_DIRS=true ./run.sh to use these paths instead.
 output:
-  frame_interval: 256      # Save frame every N epochs (0 = disabled)
-  frames_dir: "frames"     # Output directory for frames (relative or absolute path)
+  frame_interval: 2048      # Save frame every N epochs (0 = disabled)
+  frames_dir: "/media/rob/extra_data/frames"     # Output directory for frames (relative or absolute path)
   frame_format: "png"      # "png" (compressed, ~10x smaller) or "ppm" (uncompressed, fast)
   thumbnail_scale: 4       # Downscale factor for regular frames (1 = full size, 4 = 1/4 size)
   
   # Raw data saving (for post-simulation rendering)
   save_raw: false       # Save raw soup data (fast binary, no rendering)
-  raw_dir: "raw_data"  # Directory for raw data files
+  raw_dir: "/media/rob/extra_data/raw_data"  # Directory for raw data files
   async_save: true         # Save in background thread (non-blocking)
   render_frames: true  # Also render frames during simulation (if false, only save raw)
 
 # Checkpoint settings (save/restore simulation state)
 checkpoint:
   enabled: true             # Enable checkpointing
-  interval: 50000           # Save checkpoint every N epochs (0 = only at end)
-  path: "checkpoints"       # Directory for checkpoint files (relative or absolute)
+  interval: 100000           # Save checkpoint every N epochs (0 = only at end)
+  path: "/media/rob/extra_data/checkpoints"       # Directory for checkpoint files (relative or absolute)
   resume_from: ""           # Path to checkpoint file to resume from (empty = start fresh)
 
 # Energy System
 # Controls which programs can mutate based on proximity to "energy sources"
 energy:
   enabled: true          # Set to true to enable energy system
-  sources: 6             # Initial number of sources (1-8)
+  sources: 8             # Initial number of sources (1-8)
                           # 4=corners, 5=+center, 6=+edges, 8=all
   radius: 64              # Radius of each energy source
-  reserve_epochs: 50000       # Energy reserve when leaving zone
-  death_epochs: 10000       # Epochs without interaction until death (0 = infinite/never)
-  spontaneous_rate: 10     # 1 in N chance for dead tape in energy zone to spawn new random program (0 = disabled)
+  reserve_epochs: 5000       # Energy reserve when leaving zone
+  death_epochs: 5000       # Epochs without interaction until death (0 = infinite/never)
+  spontaneous_rate: 100     # 1 in N chance for dead tape in energy zone to spawn new random program (0 = disabled)
   shape: "random"         # Shape of energy zones: "circle", "strip_h", "strip_v", 
                           # "half_circle", "half_circle_bottom", "half_circle_left", "half_circle_right",
                           # "ellipse", "ellipse_v", "random" (random shape per source)
@@ -70,9 +70,9 @@ energy:
   # Make energy sources spawn, move, and expire over time
   dynamic:
     random_placement: true   # Randomize source positions
-    max_sources: 10            # Maximum simultaneous sources
+    max_sources: 16            # Maximum simultaneous sources
     source_lifetime: 10000       # Epochs until source expires (0 = infinite)
-    spawn_rate: 5000             # Spawn new source every N epochs (0 = disabled)
+    spawn_rate: 1000             # Spawn new source every N epochs (0 = disabled)
 
   # Per-Simulation Groups (optional)
   # Run different death_epochs across simulations in a single run.
@@ -81,13 +81,13 @@ energy:
   # If sim_groups is empty or omitted, all sims use the global death_epochs value above.
   #
   # Example: 3 groups with different death timeouts across 256 parallel sims:
-  sim_groups:
-    - death_epochs: 10000    # 85 sims die after 10k epochs without interaction
-      count: 85
-    - death_epochs: 100000   # 85 sims die after 100k epochs
-      count: 85
-    - death_epochs: 0        # 86 sims are immortal (never die from timeout)
-      count: 86
+  # sim_groups:
+  #   - death_epochs: 100    # 85 sims die after 10k epochs without interaction
+  #     count: 85
+  #   - death_epochs: 1000   # 85 sims die after 100k epochs
+  #     count: 85
+  #   - death_epochs: 0        # 86 sims are immortal (never die from timeout)
+  #     count: 86
 
 # =============================================
 # EXAMPLE CONFIGURATIONS

@@ -536,6 +536,12 @@ impl EnergyConfig {
         self.dynamic.source_lifetime > 0 || self.dynamic.spawn_rate > 0
     }
 
+    /// Freeze dynamic behavior so sources stay static for the full simulation.
+    pub fn freeze_dynamic(&mut self) {
+        self.dynamic.source_lifetime = 0;
+        self.dynamic.spawn_rate = 0;
+    }
+
     /// Check if a position is within any energy zone
     pub fn in_energy_zone(&self, x: usize, y: usize) -> bool {
         if !self.enabled {
@@ -1067,4 +1073,3 @@ mod tests {
         assert_eq!(event.dest_program, 20);
     }
 }
-

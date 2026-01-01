@@ -798,7 +798,9 @@ fn main() {
     } else {
         None
     };
-    
+
+    // Note: We no longer freeze_dynamic() here since CUDA now supports dynamic energy updates
+
     // Build per-sim configs if sim_groups specified
     #[allow(unused_variables)]
     let per_sim_configs: Option<Vec<(u32, u32)>> = if !args.energy_sim_groups.is_empty() {
@@ -894,6 +896,37 @@ fn main() {
                 per_sim_configs.clone(),
             ) {
                 Ok(mut cuda_sim) => {
+                    let [layout_cols, layout_rows] = args.parallel_layout;
+                    let effective_border_interaction = args.border_interaction
+                        && layout_cols * layout_rows == args.parallel_sims
+                        && (layout_cols > 1 || layout_rows > 1);
+                    
+                    if args.border_interaction && !effective_border_interaction {
+                        eprintln!("Warning: parallel_layout {:?} does not match parallel_sims {}",
+                            args.parallel_layout, args.parallel_sims);
+                        eprintln!("         Border interaction disabled.");
+                    }
+                    
+                    if effective_border_interaction {
+                        let mega_pairs = generate_mega_pairs(
+                            num_programs, args.grid_width, args.grid_height, args.neighbor_range,
+                            args.parallel_sims, layout_cols, layout_rows,
+                        );
+                        cuda_sim.set_mega_mode(true);
+                        cuda_sim.set_pairs_mega(&mega_pairs);
+                        
+                        println!("Mega-simulation mode: {}x{} grid ({} sub-sims)",
+                            layout_cols, layout_rows, args.parallel_sims);
+                        println!("  Total grid: {}x{} programs",
+                            args.grid_width * layout_cols, args.grid_height * layout_rows);
+                        println!("  Total pairs per epoch: {} (including {} cross-border)",
+                            mega_pairs.len(),
+                            mega_pairs.iter().filter(|(a, b)| a / num_programs as u32 != b / num_programs as u32).count());
+                    } else {
+                        let pairs = generate_2d_pairs(num_programs, args.grid_width, args.grid_height, args.neighbor_range);
+                        cuda_sim.set_pairs_all(&pairs);
+                    }
+                    
                     // Run CUDA simulation
                     run_cuda_simulation(
                         &mut cuda_sim,
@@ -903,6 +936,17 @@ fn main() {
                         args.frame_interval,
                         &args.frame_format,
                         args.thumbnail_scale,
+                        args.parallel_layout,
+                        effective_border_interaction,
+                        args.checkpoint_enabled,
+                        args.checkpoint_interval,
+                        &args.checkpoint_path,
+                        &args.checkpoint_resume_from,
+                        args.seed,
+                        save_raw,
+                        &args.raw_dir,
+                        args.async_save,
+                        gpu_energy_config,
                     );
                     return;
                 }
@@ -1137,11 +1181,21 @@ fn run_cuda_simulation(
     frame_interval: usize,
     frame_format: &str,
     thumbnail_scale: usize,
+    parallel_layout: [usize; 2],
+    mega_mode: bool,
+    checkpoint_enabled: bool,
+    checkpoint_interval: usize,
+    checkpoint_path: &str,
+    checkpoint_resume_from: &str,
+    seed: u64,
+    save_raw: bool,
+    raw_dir: &str,
+    async_save: bool,
+    mut energy_config: Option<energy::EnergyConfig>,
 ) {
     use std::time::Instant;
     
     let num_sims = cuda_sim.num_sims();
-    let num_programs = cuda_sim.num_programs();
     let grid_width = cuda_sim.grid_width();
     let grid_height = cuda_sim.grid_height();
     
@@ -1152,34 +1206,201 @@ fn run_cuda_simulation(
             std::fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx)).ok();
         }
     }
+    if save_raw {
+        if let Err(e) = fs::create_dir_all(raw_dir) {
+            eprintln!("Warning: Could not create raw data directory: {}", e);
+        }
+    }
+
+    // Show save mode info
+    if save_raw {
+        if async_save {
+            println!("Raw data saving: ENABLED (async, non-blocking)");
+        } else {
+            println!("Raw data saving: ENABLED (sync)");
+        }
+        println!("  Directory: {}", raw_dir);
+    }
+    if save_frames {
+        if async_save {
+            println!("Frame rendering: ENABLED (async, format: {})", frame_format);
+        } else {
+            println!("Frame rendering: ENABLED (format: {})", frame_format);
+        }
+    } else if save_raw {
+        println!("Frame rendering: DISABLED (will render later with --render-raw)");
+    }
+    println!();
+
+    // Create async writer if needed
+    let async_writer = if (save_raw || save_frames) && async_save {
+        Some(AsyncWriter::new())
+    } else {
+        None
+    };
+
+    // Check for checkpoint resume
+    let mut start_epoch = 0usize;
+    if !checkpoint_resume_from.is_empty() {
+        match checkpoint::Checkpoint::load(checkpoint_resume_from) {
+            Ok(ckpt) => {
+                if let Err(e) = ckpt.validate(grid_width, grid_height, num_sims, parallel_layout) {
+                    eprintln!("Checkpoint validation failed: {}", e);
+                    eprintln!("Starting fresh simulation instead.");
+                } else {
+                    println!("Resuming from checkpoint: {}", checkpoint_resume_from);
+                    println!("  - Epoch: {}", ckpt.header.epoch);
+                    println!("  - Saved at: {}",
+                        chrono_time_str(ckpt.header.timestamp));
+                    cuda_sim.set_all_soup(&ckpt.soup);
+                    cuda_sim.set_all_energy_states(&ckpt.energy_states);
+                    cuda_sim.set_epoch(ckpt.header.epoch as u64);
+                    start_epoch = ckpt.header.epoch;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to load checkpoint '{}': {}", checkpoint_resume_from, e);
+                eprintln!("Starting fresh simulation instead.");
+            }
+        }
+    }
     
     let start_time = Instant::now();
     let mut total_ops: u64 = 0;
     let mut last_print = Instant::now();
+    let mut last_checkpoint = start_epoch;
     
-    println!("Running {} epochs across {} simulations...", max_epochs, num_sims);
+    println!("Running {} epochs across {} simulations...", max_epochs - start_epoch, num_sims);
     
-    for epoch in 0..max_epochs {
+    for epoch in start_epoch..max_epochs {
+        // Update dynamic energy sources if needed
+        if let Some(ref mut config) = energy_config {
+            if config.is_dynamic() && config.update_sources(epoch) {
+                cuda_sim.update_energy_config(config);
+            }
+        }
+
+        let next_epoch_needs_save = frame_interval > 0
+            && (save_raw || save_frames)
+            && (epoch + 1) % frame_interval == 0
+            && epoch + 1 < max_epochs;
+        let this_epoch_needs_save = frame_interval > 0 && (save_raw || save_frames) && epoch % frame_interval == 0;
+
         let ops = cuda_sim.step();
         total_ops += ops;
+
+        if next_epoch_needs_save && !cuda_sim.has_pending_readback() {
+            cuda_sim.begin_async_readback();
+        }
         
-        // Save frames
-        if save_frames && frame_interval > 0 && epoch % frame_interval == 0 {
-            let all_soup = cuda_sim.get_all_soup();
-            
-            for sim_idx in 0..num_sims {
-                let sim_offset = sim_idx * num_programs * 64;
-                let sim_soup = &all_soup[sim_offset..sim_offset + num_programs * 64];
-                
-                let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
-                save_frame(sim_soup, grid_width, grid_height, &sim_frames_dir, epoch, frame_format, thumbnail_scale).ok();
+        // Save checkpoint
+        let will_checkpoint = checkpoint_enabled && checkpoint_interval > 0
+            && epoch > 0 && (epoch - last_checkpoint) >= checkpoint_interval;
+        if will_checkpoint {
+            let soup = cuda_sim.get_all_soup();
+            let energy_states = cuda_sim.get_all_energy_states();
+            save_checkpoint_from_data(
+                epoch + 1,
+                grid_width,
+                grid_height,
+                num_sims,
+                parallel_layout,
+                mega_mode,
+                seed,
+                soup,
+                energy_states,
+                checkpoint_path,
+            );
+            last_checkpoint = epoch + 1;
+        }
+
+        // Save frames/raw data
+        if this_epoch_needs_save {
+            let all_soup = if cuda_sim.has_pending_readback() {
+                cuda_sim.finish_async_readback().unwrap_or_else(|| cuda_sim.get_all_soup())
+            } else {
+                cuda_sim.get_all_soup()
+            };
+
+            if async_save && (save_raw || save_frames) {
+                if let Some(ref writer) = async_writer {
+                    writer.save_bundle(
+                        all_soup,
+                        epoch,
+                        if save_raw { Some(raw_dir) } else { None },
+                        if save_frames { Some(frames_dir) } else { None },
+                        grid_width,
+                        grid_height,
+                        num_sims,
+                        parallel_layout,
+                        frame_format,
+                        thumbnail_scale,
+                        mega_mode,
+                    );
+                } else {
+                    if save_raw {
+                        if let Err(e) = save_raw_data_sync(
+                            &all_soup,
+                            epoch,
+                            raw_dir,
+                            grid_width,
+                            grid_height,
+                            num_sims,
+                            parallel_layout,
+                        ) {
+                            eprintln!("Warning: Could not save raw data {}: {}", epoch, e);
+                        }
+                    }
+                    if save_frames {
+                        save_frames_from_data(
+                            &all_soup,
+                            num_sims,
+                            grid_width,
+                            grid_height,
+                            frames_dir,
+                            epoch,
+                            frame_format,
+                            thumbnail_scale,
+                            mega_mode,
+                            parallel_layout,
+                        );
+                    }
+                }
+            } else {
+                if save_raw {
+                    if let Err(e) = save_raw_data_sync(
+                        &all_soup,
+                        epoch,
+                        raw_dir,
+                        grid_width,
+                        grid_height,
+                        num_sims,
+                        parallel_layout,
+                    ) {
+                        eprintln!("Warning: Could not save raw data {}: {}", epoch, e);
+                    }
+                }
+                if save_frames {
+                    save_frames_from_data(
+                        &all_soup,
+                        num_sims,
+                        grid_width,
+                        grid_height,
+                        frames_dir,
+                        epoch,
+                        frame_format,
+                        thumbnail_scale,
+                        mega_mode,
+                        parallel_layout,
+                    );
+                }
             }
         }
         
         // Progress update every second
         if last_print.elapsed().as_secs() >= 1 {
             let elapsed = start_time.elapsed().as_secs_f64();
-            let epochs_per_sec = (epoch + 1) as f64 / elapsed;
+            let epochs_per_sec = (epoch + 1 - start_epoch) as f64 / elapsed;
             let ops_per_sec = total_ops as f64 / elapsed;
             let remaining = (max_epochs - epoch - 1) as f64 / epochs_per_sec;
             
@@ -1188,6 +1409,30 @@ fn run_cuda_simulation(
             std::io::Write::flush(&mut std::io::stdout()).ok();
             last_print = Instant::now();
         }
+    }
+
+    // Save final checkpoint
+    if checkpoint_enabled {
+        let soup = cuda_sim.get_all_soup();
+        let energy_states = cuda_sim.get_all_energy_states();
+        save_checkpoint_from_data(
+            max_epochs,
+            grid_width,
+            grid_height,
+            num_sims,
+            parallel_layout,
+            mega_mode,
+            seed,
+            soup,
+            energy_states,
+            checkpoint_path,
+        );
+    }
+
+    // Shutdown async writer (wait for pending saves)
+    if let Some(writer) = async_writer {
+        println!("Waiting for async saves to complete...");
+        writer.shutdown();
     }
     
     println!("\n\nCUDA simulation complete!");
@@ -1310,14 +1555,22 @@ fn run_multi_gpu_simulation(
         }
     }
     if save_frames {
-        println!("Frame rendering: ENABLED (format: {})", frame_format);
+        if async_save {
+            println!("Frame rendering: ENABLED (async, format: {})", frame_format);
+        } else {
+            println!("Frame rendering: ENABLED (format: {})", frame_format);
+        }
+        let _ = fs::create_dir_all(frames_dir);
+        for sim_idx in 0..num_sims {
+            let _ = fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx));
+        }
     } else if save_raw {
         println!("Frame rendering: DISABLED (will render later with --render-raw)");
     }
     println!();
     
     // Create async writer if needed
-    let async_writer = if save_raw && async_save {
+    let async_writer = if (save_raw || save_frames) && async_save {
         Some(AsyncWriter::new())
     } else {
         None
@@ -1379,46 +1632,77 @@ fn run_multi_gpu_simulation(
                 multi_sim.get_all_soup()
             };
             
-            // Save raw data (async or sync I/O)
-            if save_raw {
+            if async_save && (save_raw || save_frames) {
                 if let Some(ref writer) = async_writer {
-                    // Async save - clone data and send to background thread
-                    writer.save_raw(
-                        all_soup.clone(), epoch, raw_dir, 
-                        grid_width, grid_height, num_sims, parallel_layout
+                    writer.save_bundle(
+                        all_soup,
+                        epoch,
+                        if save_raw { Some(raw_dir) } else { None },
+                        if save_frames { Some(frames_dir) } else { None },
+                        grid_width,
+                        grid_height,
+                        num_sims,
+                        parallel_layout,
+                        frame_format,
+                        thumbnail_scale,
+                        effective_border_interaction,
                     );
                 } else {
-                    // Sync save
+                    if save_raw {
+                        if let Err(e) = save_raw_data_sync(
+                            &all_soup,
+                            epoch,
+                            raw_dir,
+                            grid_width,
+                            grid_height,
+                            num_sims,
+                            parallel_layout,
+                        ) {
+                            eprintln!("Warning: Could not save raw data for epoch {}: {}", epoch, e);
+                        }
+                    }
+                    if save_frames {
+                        save_frames_from_data(
+                            &all_soup,
+                            num_sims,
+                            grid_width,
+                            grid_height,
+                            frames_dir,
+                            epoch,
+                            frame_format,
+                            thumbnail_scale,
+                            effective_border_interaction,
+                            parallel_layout,
+                        );
+                    }
+                }
+            } else {
+                if save_raw {
                     if let Err(e) = save_raw_data_sync(
-                        &all_soup, epoch, raw_dir,
-                        grid_width, grid_height, num_sims, parallel_layout
+                        &all_soup,
+                        epoch,
+                        raw_dir,
+                        grid_width,
+                        grid_height,
+                        num_sims,
+                        parallel_layout,
                     ) {
                         eprintln!("Warning: Could not save raw data for epoch {}: {}", epoch, e);
                     }
                 }
-            }
-            
-            // Save rendered frames
-            if save_frames {
-                // In mega-simulation mode, also save a combined frame
-                if effective_border_interaction {
-                    let _ = save_mega_frame_from_data(
-                        &all_soup, layout_cols, layout_rows, grid_width, grid_height,
-                        frames_dir, epoch, thumbnail_scale, num_sims
+                if save_frames {
+                    save_frames_from_data(
+                        &all_soup,
+                        num_sims,
+                        grid_width,
+                        grid_height,
+                        frames_dir,
+                        epoch,
+                        frame_format,
+                        thumbnail_scale,
+                        effective_border_interaction,
+                        parallel_layout,
                     );
-                }
-                
-                // Extract per-sim data from combined soup
-                let sim_size = grid_width * grid_height * 64;
-                for sim_idx in 0..num_sims {
-                    let start = sim_idx * sim_size;
-                    let end = start + sim_size;
-                    let soup = &all_soup[start..end];
-                    let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
-                    let _ = fs::create_dir_all(&sim_frames_dir);
-                    if let Err(e) = save_frame(soup, grid_width, grid_height, &sim_frames_dir, epoch, frame_format, thumbnail_scale) {
-                        eprintln!("Warning: Could not save frame {} for sim {}: {}", epoch, sim_idx, e);
-                    }
                 }
             }
         }
@@ -1475,17 +1759,29 @@ fn run_multi_gpu_simulation(
         if save_raw {
             let all_soup = multi_sim.get_all_soup();
             if let Some(ref writer) = async_writer {
-                writer.save_raw(
-                    all_soup, max_epochs, raw_dir,
-                    grid_width, grid_height, num_sims, parallel_layout
+                writer.save_bundle(
+                    all_soup,
+                    max_epochs,
+                    Some(raw_dir),
+                    None,
+                    grid_width,
+                    grid_height,
+                    num_sims,
+                    parallel_layout,
+                    frame_format,
+                    thumbnail_scale,
+                    effective_border_interaction,
                 );
-            } else {
-                if let Err(e) = save_raw_data_sync(
-                    &all_soup, max_epochs, raw_dir,
-                    grid_width, grid_height, num_sims, parallel_layout
-                ) {
-                    eprintln!("Warning: Could not save final raw data: {}", e);
-                }
+            } else if let Err(e) = save_raw_data_sync(
+                &all_soup,
+                max_epochs,
+                raw_dir,
+                grid_width,
+                grid_height,
+                num_sims,
+                parallel_layout,
+            ) {
+                eprintln!("Warning: Could not save final raw data: {}", e);
             }
         }
         
@@ -1692,7 +1988,7 @@ fn generate_2d_pairs(
 /// Generate all pairs for mega-simulation mode with absolute indices.
 /// Includes both internal pairs (within each sim) and cross-border pairs (between adjacent sims).
 /// Cross-border pairs are generated FIRST to ensure edge programs interact with neighbors.
-#[cfg(feature = "wgpu-compute")]
+#[cfg(any(feature = "wgpu-compute", feature = "cuda"))]
 fn generate_mega_pairs(
     num_programs: usize,
     grid_width: usize,
@@ -1828,7 +2124,33 @@ fn save_checkpoint(
 ) {
     let soup = multi_sim.get_all_soup();
     let energy_states = multi_sim.get_all_energy_states();
-    
+    save_checkpoint_from_data(
+        epoch,
+        grid_width,
+        grid_height,
+        num_sims,
+        parallel_layout,
+        border_interaction,
+        seed,
+        soup,
+        energy_states,
+        checkpoint_path,
+    );
+}
+
+#[cfg(any(feature = "wgpu-compute", feature = "cuda"))]
+fn save_checkpoint_from_data(
+    epoch: usize,
+    grid_width: usize,
+    grid_height: usize,
+    num_sims: usize,
+    parallel_layout: [usize; 2],
+    border_interaction: bool,
+    seed: u64,
+    soup: Vec<u8>,
+    energy_states: Vec<u32>,
+    checkpoint_path: &str,
+) {
     let ckpt = checkpoint::Checkpoint::new(
         epoch,
         grid_width,
@@ -1954,7 +2276,6 @@ fn save_mega_frame(
 
 /// Save a combined mega-frame from pre-fetched soup data
 /// Used by async readback path to avoid re-fetching from GPU
-#[cfg(feature = "wgpu-compute")]
 fn save_mega_frame_from_data(
     all_soup: &[u8],
     layout_cols: usize,
@@ -1973,7 +2294,7 @@ fn save_mega_frame_from_data(
     let sub_img_height = grid_height * 8;
     let full_width = sub_img_width * layout_cols;
     let full_height = sub_img_height * layout_rows;
-    let sim_size = grid_width * grid_height * 64;
+    let sim_size = grid_width * grid_height * SINGLE_TAPE_SIZE;
     
     // Output dimensions after scaling
     let out_width = full_width / scale;
@@ -2056,6 +2377,58 @@ fn save_mega_frame_from_data(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     
     Ok(())
+}
+
+/// Save per-sim frames (and optional mega frame) from combined soup data
+fn save_frames_from_data(
+    all_soup: &[u8],
+    num_sims: usize,
+    grid_width: usize,
+    grid_height: usize,
+    frames_dir: &str,
+    epoch: usize,
+    frame_format: &str,
+    thumbnail_scale: usize,
+    mega_mode: bool,
+    parallel_layout: [usize; 2],
+) {
+    let _ = fs::create_dir_all(frames_dir);
+    if mega_mode {
+        let [layout_cols, layout_rows] = parallel_layout;
+        if let Err(e) = save_mega_frame_from_data(
+            all_soup,
+            layout_cols,
+            layout_rows,
+            grid_width,
+            grid_height,
+            frames_dir,
+            epoch,
+            thumbnail_scale,
+            num_sims,
+        ) {
+            eprintln!("Warning: Could not save mega frame {}: {}", epoch, e);
+        }
+    }
+
+    let sim_size = grid_width * grid_height * 64;
+    for sim_idx in 0..num_sims {
+        let start = sim_idx * sim_size;
+        let end = start + sim_size;
+        let soup = &all_soup[start..end];
+        let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
+        let _ = fs::create_dir_all(&sim_frames_dir);
+        if let Err(e) = save_frame(
+            soup,
+            grid_width,
+            grid_height,
+            &sim_frames_dir,
+            epoch,
+            frame_format,
+            thumbnail_scale,
+        ) {
+            eprintln!("Warning: Could not save frame {} for sim {}: {}", epoch, sim_idx, e);
+        }
+    }
 }
 
 /// Format a Unix timestamp as a human-readable string
@@ -2233,22 +2606,30 @@ fn init_byte_colors() -> [[u8; 3]; 256] {
 }
 
 // ============================================================================
-// RAW DATA SAVING & ASYNC WRITER
+// ASYNC WRITER
 // ============================================================================
+
+/// Bundle of outputs to save asynchronously
+#[allow(dead_code)]
+struct SaveBundle {
+    data: Vec<u8>,
+    epoch: usize,
+    raw_dir: Option<String>,
+    frames_dir: Option<String>,
+    grid_width: usize,
+    grid_height: usize,
+    num_sims: usize,
+    layout: [usize; 2],
+    frame_format: String,
+    thumbnail_scale: usize,
+    mega_mode: bool,
+}
 
 /// Message type for async save operations
 #[allow(dead_code)]
 enum SaveMessage {
-    /// Save raw soup data
-    RawData {
-        data: Vec<u8>,
-        epoch: usize,
-        path: String,
-        grid_width: usize,
-        grid_height: usize,
-        num_sims: usize,
-        layout: [usize; 2],
-    },
+    /// Save raw and/or rendered frames from soup data
+    Bundle(SaveBundle),
     /// Shutdown the writer thread
     Shutdown,
 }
@@ -2269,9 +2650,33 @@ impl AsyncWriter {
         let handle = thread::spawn(move || {
             while let Ok(msg) = receiver.recv() {
                 match msg {
-                    SaveMessage::RawData { data, epoch, path, grid_width, grid_height, num_sims, layout } => {
-                        if let Err(e) = save_raw_data_sync(&data, epoch, &path, grid_width, grid_height, num_sims, layout) {
-                            eprintln!("Async save error (epoch {}): {}", epoch, e);
+                    SaveMessage::Bundle(bundle) => {
+                        if let Some(path) = bundle.raw_dir.as_deref() {
+                            if let Err(e) = save_raw_data_sync(
+                                &bundle.data,
+                                bundle.epoch,
+                                path,
+                                bundle.grid_width,
+                                bundle.grid_height,
+                                bundle.num_sims,
+                                bundle.layout,
+                            ) {
+                                eprintln!("Async save error (epoch {}): {}", bundle.epoch, e);
+                            }
+                        }
+                        if let Some(frames_dir) = bundle.frames_dir.as_deref() {
+                            save_frames_from_data(
+                                &bundle.data,
+                                bundle.num_sims,
+                                bundle.grid_width,
+                                bundle.grid_height,
+                                frames_dir,
+                                bundle.epoch,
+                                &bundle.frame_format,
+                                bundle.thumbnail_scale,
+                                bundle.mega_mode,
+                                bundle.layout,
+                            );
                         }
                     }
                     SaveMessage::Shutdown => break,
@@ -2285,17 +2690,34 @@ impl AsyncWriter {
         }
     }
     
-    /// Queue a raw data save operation (non-blocking)
-    fn save_raw(&self, data: Vec<u8>, epoch: usize, path: &str, grid_width: usize, grid_height: usize, num_sims: usize, layout: [usize; 2]) {
-        let msg = SaveMessage::RawData {
+    /// Queue raw and/or frame saves (non-blocking)
+    fn save_bundle(
+        &self,
+        data: Vec<u8>,
+        epoch: usize,
+        raw_dir: Option<&str>,
+        frames_dir: Option<&str>,
+        grid_width: usize,
+        grid_height: usize,
+        num_sims: usize,
+        layout: [usize; 2],
+        frame_format: &str,
+        thumbnail_scale: usize,
+        mega_mode: bool,
+    ) {
+        let msg = SaveMessage::Bundle(SaveBundle {
             data,
             epoch,
-            path: path.to_string(),
+            raw_dir: raw_dir.map(|s| s.to_string()),
+            frames_dir: frames_dir.map(|s| s.to_string()),
             grid_width,
             grid_height,
             num_sims,
             layout,
-        };
+            frame_format: frame_format.to_string(),
+            thumbnail_scale,
+            mega_mode,
+        });
         if self.sender.send(msg).is_err() {
             eprintln!("Warning: async save queue full or closed");
         }
@@ -2534,4 +2956,3 @@ fn render_raw_directory(
     
     Ok(())
 }
-

@@ -13,6 +13,8 @@
 #[cfg(feature = "cuda")]
 use cudarc::driver::*;
 #[cfg(feature = "cuda")]
+use cudarc::driver::result;
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 /// Generate simple pairs for simulation (adjacent programs)
@@ -27,11 +29,121 @@ fn generate_pairs(num_programs: usize) -> Vec<(usize, usize)> {
     pairs
 }
 
+#[cfg(feature = "cuda")]
+fn sim_hash_cpu(sim_idx: u32, src_idx: u32) -> u32 {
+    let mut h = sim_idx.wrapping_mul(0x9E3779B9).wrapping_add(src_idx.wrapping_mul(0x85EBCA6B));
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x21F0AAAD);
+    h ^= h >> 15;
+    h
+}
+
+#[cfg(feature = "cuda")]
+fn source_offset_x_cpu(sim_idx: u32, src_idx: u32, base_x: u32, grid_width: u32) -> u32 {
+    let h = sim_hash_cpu(sim_idx, src_idx * 2);
+    let offset = (h % grid_width) as i32 - (grid_width / 2) as i32;
+    let new_x = base_x as i32 + offset;
+    ((new_x + grid_width as i32) % grid_width as i32) as u32
+}
+
+#[cfg(feature = "cuda")]
+fn source_offset_y_cpu(sim_idx: u32, src_idx: u32, base_y: u32, grid_height: u32) -> u32 {
+    let h = sim_hash_cpu(sim_idx, src_idx * 2 + 1);
+    let offset = (h % grid_height) as i32 - (grid_height / 2) as i32;
+    let new_y = base_y as i32 + offset;
+    ((new_y + grid_height as i32) % grid_height as i32) as u32
+}
+
+#[cfg(feature = "cuda")]
+fn in_source_cpu(x: i32, y: i32, sx: u32, sy: u32, shape: u32, radius: u32) -> bool {
+    let dx = x as f32 - sx as f32;
+    let dy = y as f32 - sy as f32;
+    let r = radius as f32;
+    let r_sq = r * r;
+    let dist_sq = dx * dx + dy * dy;
+
+    match shape {
+        0 => dist_sq <= r_sq,
+        1 => dx.abs() <= r && dy.abs() <= r / 4.0,
+        2 => dx.abs() <= r / 4.0 && dy.abs() <= r,
+        3 => dy <= 0.0 && dist_sq <= r_sq,
+        4 => dy >= 0.0 && dist_sq <= r_sq,
+        5 => dx <= 0.0 && dist_sq <= r_sq,
+        6 => dx >= 0.0 && dist_sq <= r_sq,
+        7 => {
+            let norm = (dx / r).powi(2) + (dy / (r / 2.0)).powi(2);
+            norm <= 1.0
+        }
+        8 => {
+            let norm = (dx / (r / 2.0)).powi(2) + (dy / r).powi(2);
+            norm <= 1.0
+        }
+        _ => dist_sq <= r_sq,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn compute_energy_map(
+    config: Option<&crate::energy::EnergyConfig>,
+    num_programs: usize,
+    num_sims: usize,
+    grid_width: usize,
+    grid_height: usize,
+) -> Vec<u32> {
+    let total_programs = num_programs * num_sims;
+    let num_words = (total_programs + 31) / 32;
+    let mut map = vec![0u32; num_words];
+
+    let config = match config {
+        Some(cfg) if cfg.enabled && !cfg.sources.is_empty() => cfg,
+        _ => {
+            for word in &mut map {
+                *word = 0xFFFFFFFF;
+            }
+            return map;
+        }
+    };
+
+    let sources: Vec<(u32, u32, u32, u32)> = config
+        .sources
+        .iter()
+        .take(8)
+        .map(|s| (s.x as u32, s.y as u32, s.shape.to_gpu_id(), s.radius as u32))
+        .collect();
+
+    for sim_idx in 0..num_sims {
+        for prog_idx in 0..num_programs {
+            let x = (prog_idx % grid_width) as i32;
+            let y = (prog_idx / grid_width) as i32;
+
+            let mut in_zone = false;
+            for (src_idx, (base_x, base_y, shape, radius)) in sources.iter().enumerate() {
+                let offset_x = source_offset_x_cpu(sim_idx as u32, src_idx as u32, *base_x, grid_width as u32);
+                let offset_y = source_offset_y_cpu(sim_idx as u32, src_idx as u32, *base_y, grid_height as u32);
+                if in_source_cpu(x, y, offset_x, offset_y, *shape, *radius) {
+                    in_zone = true;
+                    break;
+                }
+            }
+
+            if in_zone {
+                let global_idx = sim_idx * num_programs + prog_idx;
+                let word_idx = global_idx / 32;
+                let bit_idx = global_idx % 32;
+                map[word_idx] |= 1u32 << bit_idx;
+            }
+        }
+    }
+
+    map
+}
+
 /// CUDA kernel source for batched multi-simulation BFF evaluation
 /// This kernel supports:
 /// - Multiple simulations in parallel (batched)
 /// - Energy system with per-sim death_timer and reserve_duration
 /// - Full 64-bit addressing (no 4GB limit)
+/// - Per-block reduction for ops counter (reduces atomic contention)
 #[cfg(feature = "cuda")]
 const BFF_CUDA_KERNEL: &str = r#"
 extern "C" __global__ void bff_batched_evaluate(
@@ -44,280 +156,364 @@ extern "C" __global__ void bff_batched_evaluate(
     // Packed parameters (to fit cudarc's 12-param limit)
     unsigned long long params_packed1, // num_pairs(hi) | num_programs(lo)
     unsigned long long params_packed2, // num_sims(hi) | steps_per_run(lo)
-    unsigned long long params_packed3, // mutation_prob(hi) | energy_enabled(lo)
+    unsigned long long params_packed3, // mutation_prob(hi) | flags(lo: bit0=energy_enabled, bit1=mega_mode)
     unsigned long long seed,
     unsigned long long epoch
 ) {
+    // Shared memory for per-block ops reduction (256 threads per block)
+    __shared__ unsigned long long block_ops[256];
+    unsigned int tid = threadIdx.x;
+
     // Unpack parameters
     unsigned int num_pairs = (unsigned int)(params_packed1 >> 32);
     unsigned int num_programs = (unsigned int)(params_packed1 & 0xFFFFFFFF);
     unsigned int num_sims = (unsigned int)(params_packed2 >> 32);
     unsigned int steps_per_run = (unsigned int)(params_packed2 & 0xFFFFFFFF);
     unsigned int mutation_prob = (unsigned int)(params_packed3 >> 32);
-    unsigned int energy_enabled = (unsigned int)(params_packed3 & 0xFFFFFFFF);
+    unsigned int flags = (unsigned int)(params_packed3 & 0xFFFFFFFF);
+    unsigned int energy_enabled = flags & 1u;
+    unsigned int mega_mode = (flags >> 1) & 1u;
     const int SINGLE_TAPE_SIZE = 64;
     const int FULL_TAPE_SIZE = 128;
-    
-    // Global pair index across all sims
+
+    // Global pair index across all sims (normal mode) or across all pairs (mega mode)
     unsigned long long global_idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    
-    
-    // Calculate which sim and which pair within that sim
-    unsigned int sim_idx = global_idx / num_pairs;
-    unsigned int pair_idx = global_idx % num_pairs;
-    
-    if (sim_idx >= num_sims || pair_idx >= num_pairs) return;
-    
-    // Get program indices (local to sim)
-    unsigned int p1_local = pair_indices[pair_idx * 2];
-    unsigned int p2_local = pair_indices[pair_idx * 2 + 1];
-    
-    // Convert to absolute indices
-    unsigned long long sim_offset = (unsigned long long)sim_idx * num_programs;
-    unsigned long long p1_abs = sim_offset + p1_local;
-    unsigned long long p2_abs = sim_offset + p2_local;
-    
-    // Get per-sim energy config
-    unsigned int death_timer = sim_configs[sim_idx * 2];
-    unsigned int reserve_duration = sim_configs[sim_idx * 2 + 1];
-    
-    // Check energy zone membership (bitmask lookup)
-    auto in_energy_zone = [&](unsigned long long prog_idx) -> bool {
-        unsigned int word_idx = prog_idx / 32;
-        unsigned int bit_idx = prog_idx % 32;
-        return (energy_map[word_idx] & (1u << bit_idx)) != 0;
-    };
-    
-    // Energy state helpers - packed as: reserve(16 bits) | timer(8 bits) | dead(8 bits)
-    auto get_reserve = [](unsigned int state) -> unsigned int { return state & 0xFFFF; };
-    auto get_timer = [](unsigned int state) -> unsigned int { return (state >> 16) & 0xFF; };
-    auto is_dead = [](unsigned int state) -> bool { return ((state >> 24) & 0xFF) != 0; };
-    auto pack_state = [](unsigned int reserve, unsigned int timer, bool dead) -> unsigned int {
-        return (reserve & 0xFFFF) | ((timer & 0xFF) << 16) | ((dead ? 1u : 0u) << 24);
-    };
-    
-    // Load energy states
-    unsigned int p1_state = energy_state[p1_abs];
-    unsigned int p2_state = energy_state[p2_abs];
-    bool p1_in_zone = energy_enabled && in_energy_zone(p1_abs);
-    bool p2_in_zone = energy_enabled && in_energy_zone(p2_abs);
-    bool p1_was_dead = energy_enabled && is_dead(p1_state);
-    bool p2_was_dead = energy_enabled && is_dead(p2_state);
-    
-    // Skip if both dead and not in energy zones (can't be revived)
-    if (energy_enabled && p1_was_dead && p2_was_dead && !p1_in_zone && !p2_in_zone) {
-        return;
-    }
-    
-    // Can mutate check
-    auto can_mutate = [&](unsigned long long prog_idx, unsigned int state, bool in_zone) -> bool {
-        if (!energy_enabled) return true;
-        if (is_dead(state)) return false;
-        return in_zone || get_reserve(state) > 0;
-    };
-    
-    bool p1_can_mutate = can_mutate(p1_abs, p1_state, p1_in_zone);
-    bool p2_can_mutate = can_mutate(p2_abs, p2_state, p2_in_zone);
-    
-    // Local tape (128 bytes)
-    unsigned char tape[FULL_TAPE_SIZE];
-    
-    // Copy programs to local tape (use 64-bit offsets)
-    unsigned long long p1_byte_offset = p1_abs * SINGLE_TAPE_SIZE;
-    unsigned long long p2_byte_offset = p2_abs * SINGLE_TAPE_SIZE;
-    
-    for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-        tape[i] = soup[p1_byte_offset + i];
-        tape[SINGLE_TAPE_SIZE + i] = soup[p2_byte_offset + i];
-    }
-    
-    // LCG for fast mutations
-    auto lcg = [](unsigned int s) -> unsigned int {
-        return s * 1664525u + 1013904223u;
-    };
-    
-    // Apply mutations with geometric skip (sparse mutation optimization)
-    unsigned int rng = (unsigned int)(seed ^ epoch ^ (global_idx * 0x9E3779B9ULL));
-    
-    if (p1_can_mutate) {
-        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-            rng = lcg(rng);
-            if ((rng & 0x3FFFFFFF) < mutation_prob) {
-                rng = lcg(rng);
-                tape[i] = (unsigned char)(rng & 0xFF);
-            }
-        }
-    }
-    
-    if (p2_can_mutate) {
-        for (int i = SINGLE_TAPE_SIZE; i < FULL_TAPE_SIZE; i++) {
-            rng = lcg(rng);
-            if ((rng & 0x3FFFFFFF) < mutation_prob) {
-                rng = lcg(rng);
-                tape[i] = (unsigned char)(rng & 0xFF);
-            }
-        }
-    }
-    
-    // Track if copies occurred (for energy inheritance)
-    bool p1_received_copy = false;
-    bool p2_received_copy = false;
-    
-    // BFF Evaluation
-    int pos = 2;
-    int head0 = tape[0] & (FULL_TAPE_SIZE - 1);
-    int head1 = tape[1] & (FULL_TAPE_SIZE - 1);
+
+    // Initialize ops counter for this thread (will be 0 if we skip work)
     unsigned int ops = 0;
-    
-    
-    for (unsigned int step = 0; step < steps_per_run; step++) {
-        head0 = head0 & (FULL_TAPE_SIZE - 1);
-        head1 = head1 & (FULL_TAPE_SIZE - 1);
-        
-        unsigned char cmd = tape[pos];
-        
-        // BFF commands as byte values: < > { } + - . , [ ]
-        // 0x3C=60, 0x3E=62, 0x7B=123, 0x7D=125, 0x2B=43, 0x2D=45, 0x2E=46, 0x2C=44, 0x5B=91, 0x5D=93
-        switch (cmd) {
-            case 0x3C: head0--; ops++; break;  // '<'
-            case 0x3E: head0++; ops++; break;  // '>'
-            case 0x7B: head1--; ops++; break;  // '{'
-            case 0x7D: head1++; ops++; break;  // '}'
-            case 0x2B: tape[head0 & (FULL_TAPE_SIZE-1)]++; ops++; break;  // '+'
-            case 0x2D: tape[head0 & (FULL_TAPE_SIZE-1)]--; ops++; break;  // '-'
-            case 0x2E:  // '.'
-                tape[head1 & (FULL_TAPE_SIZE-1)] = tape[head0 & (FULL_TAPE_SIZE-1)];
-                // Track copy direction for energy
-                if ((head0 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE && 
-                    (head1 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE) {
-                    p2_received_copy = true;
-                } else if ((head0 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE && 
-                           (head1 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE) {
-                    p1_received_copy = true;
-                }
-                ops++;
-                break;
-            case 0x2C:  // ','
-                tape[head0 & (FULL_TAPE_SIZE-1)] = tape[head1 & (FULL_TAPE_SIZE-1)];
-                // Track copy direction for energy
-                if ((head1 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE && 
-                    (head0 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE) {
-                    p2_received_copy = true;
-                } else if ((head1 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE && 
-                           (head0 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE) {
-                    p1_received_copy = true;
-                }
-                ops++;
-                break;
-            case 0x5B:  // '['
-                if (tape[head0 & (FULL_TAPE_SIZE-1)] == 0) {
-                    int depth = 1;
-                    pos++;
-                    while (pos < FULL_TAPE_SIZE && depth > 0) {
-                        if (tape[pos] == 0x5D) depth--;  // ']'
-                        if (tape[pos] == 0x5B) depth++;  // '['
-                        pos++;
-                    }
-                    pos--;
-                    if (depth != 0) pos = FULL_TAPE_SIZE;
-                }
-                ops++;
-                break;
-            case 0x5D:  // ']'
-                if (tape[head0 & (FULL_TAPE_SIZE-1)] != 0) {
-                    int depth = 1;
-                    pos--;
-                    while (pos >= 0 && depth > 0) {
-                        if (tape[pos] == 0x5D) depth++;  // ']'
-                        if (tape[pos] == 0x5B) depth--;  // '['
-                        pos--;
-                    }
-                    pos++;
-                    if (depth != 0) pos = -1;
-                }
-                ops++;
-                break;
-        }
-        
-        if (pos < 0) break;
-        pos++;
-        if (pos >= FULL_TAPE_SIZE) break;
-    }
-    
-    // Update energy states
-    bool p1_stays_dead = false;
-    bool p2_stays_dead = false;
-    
-    if (energy_enabled) {
-        // P1 energy update
-        unsigned int p1_reserve = get_reserve(p1_state);
-        unsigned int p1_timer = get_timer(p1_state);
-        bool p1_dead = p1_was_dead;
-        
-        if (p1_in_zone) {
-            p1_reserve = reserve_duration;
-            p1_timer = 0;
-        } else if (p1_received_copy) {
-            p1_reserve = p2_in_zone ? reserve_duration : get_reserve(p2_state);
-            p1_timer = 0;
-            p1_dead = false;
+
+    // Use a flag instead of early returns so all threads can participate in reduction
+    bool should_process = true;
+
+    unsigned int pair_idx = 0;
+    unsigned int sim_idx = 0;
+    unsigned int p1_local = 0;
+    unsigned int p2_local = 0;
+    unsigned int p1_sim = 0;
+    unsigned int p2_sim = 0;
+    unsigned long long p1_abs = 0;
+    unsigned long long p2_abs = 0;
+
+    if (mega_mode) {
+        pair_idx = (unsigned int)global_idx;
+        if (pair_idx >= num_pairs) {
+            should_process = false;
         } else {
-            if (p1_reserve > 0) p1_reserve--;
-            if (!p1_dead) p1_timer++;
-            // death_timer = 0 means infinite (never dies)
-            if (death_timer > 0 && p1_timer > death_timer && !p1_dead) {
-                p1_dead = true;
-            }
-        }
-        p1_stays_dead = p1_was_dead && p1_dead;
-        energy_state[p1_abs] = pack_state(p1_reserve, p1_timer, p1_dead);
-        
-        // P2 energy update
-        unsigned int p2_reserve = get_reserve(p2_state);
-        unsigned int p2_timer = get_timer(p2_state);
-        bool p2_dead = p2_was_dead;
-        
-        if (p2_in_zone) {
-            p2_reserve = reserve_duration;
-            p2_timer = 0;
-        } else if (p2_received_copy) {
-            p2_reserve = p1_in_zone ? reserve_duration : get_reserve(p1_state);
-            p2_timer = 0;
-            p2_dead = false;
-        } else {
-            if (p2_reserve > 0) p2_reserve--;
-            if (!p2_dead) p2_timer++;
-            if (death_timer > 0 && p2_timer > death_timer && !p2_dead) {
-                p2_dead = true;
-            }
-        }
-        p2_stays_dead = p2_was_dead && p2_dead;
-        energy_state[p2_abs] = pack_state(p2_reserve, p2_timer, p2_dead);
-    }
-    
-    // Write back soup
-    if (p1_stays_dead) {
-        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-            soup[p1_byte_offset + i] = 0;
+            // Pairs are absolute indices across all sims
+            p1_abs = pair_indices[pair_idx * 2];
+            p2_abs = pair_indices[pair_idx * 2 + 1];
+            p1_sim = (unsigned int)(p1_abs / num_programs);
+            p2_sim = (unsigned int)(p2_abs / num_programs);
+            p1_local = (unsigned int)(p1_abs % num_programs);
+            p2_local = (unsigned int)(p2_abs % num_programs);
+            sim_idx = p1_sim; // RNG uses p1's sim index
         }
     } else {
-        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-            soup[p1_byte_offset + i] = tape[i];
+        // Normal mode: pairs are local per sim
+        sim_idx = (unsigned int)(global_idx / num_pairs);
+        pair_idx = (unsigned int)(global_idx % num_pairs);
+        if (sim_idx >= num_sims || pair_idx >= num_pairs) {
+            should_process = false;
+        } else {
+            p1_local = pair_indices[pair_idx * 2];
+            p2_local = pair_indices[pair_idx * 2 + 1];
+
+            unsigned long long sim_offset = (unsigned long long)sim_idx * num_programs;
+            p1_abs = sim_offset + p1_local;
+            p2_abs = sim_offset + p2_local;
+            p1_sim = sim_idx;
+            p2_sim = sim_idx;
         }
     }
-    
-    if (p2_stays_dead) {
-        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-            soup[p2_byte_offset + i] = 0;
+
+    if (should_process) {
+        // Get per-sim energy config (may differ for p1/p2 in mega mode)
+        unsigned int p1_death_timer = sim_configs[p1_sim * 2];
+        unsigned int p1_reserve_duration = sim_configs[p1_sim * 2 + 1];
+        unsigned int p2_death_timer = sim_configs[p2_sim * 2];
+        unsigned int p2_reserve_duration = sim_configs[p2_sim * 2 + 1];
+
+        // Check energy zone membership (bitmask lookup) - use bitwise ops for speed
+        auto in_energy_zone = [&](unsigned long long prog_idx) -> bool {
+            unsigned int word_idx = (unsigned int)(prog_idx >> 5);  // prog_idx / 32
+            unsigned int bit_idx = (unsigned int)(prog_idx & 31);   // prog_idx % 32
+            return (energy_map[word_idx] & (1u << bit_idx)) != 0;
+        };
+
+        // Energy state helpers - packed as: reserve(8 bits) | timer(8 bits) | dead(8 bits)
+        auto get_reserve = [](unsigned int state) -> unsigned int { return state & 0xFF; };
+        auto get_timer = [](unsigned int state) -> unsigned int { return (state >> 8) & 0xFF; };
+        auto is_dead = [](unsigned int state) -> bool { return ((state >> 16) & 0xFF) != 0; };
+        auto pack_state = [](unsigned int reserve, unsigned int timer, bool dead) -> unsigned int {
+            return (reserve & 0xFF) | ((timer & 0xFF) << 8) | ((dead ? 1u : 0u) << 16);
+        };
+
+        // Load energy states
+        unsigned int p1_state = energy_state[p1_abs];
+        unsigned int p2_state = energy_state[p2_abs];
+        bool p1_in_zone = energy_enabled && in_energy_zone(p1_abs);
+        bool p2_in_zone = energy_enabled && in_energy_zone(p2_abs);
+        bool p1_was_dead = energy_enabled && is_dead(p1_state);
+        bool p2_was_dead = energy_enabled && is_dead(p2_state);
+
+        // Skip if both dead and not in energy zones (can't be revived)
+        if (energy_enabled && p1_was_dead && p2_was_dead && !p1_in_zone && !p2_in_zone) {
+            should_process = false;
         }
-    } else {
-        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
-            soup[p2_byte_offset + i] = tape[SINGLE_TAPE_SIZE + i];
+
+        if (should_process) {
+            // Can mutate check
+            auto can_mutate = [&](unsigned long long prog_idx, unsigned int state, bool in_zone) -> bool {
+                if (!energy_enabled) return true;
+                if (is_dead(state)) return false;
+                return in_zone || get_reserve(state) > 0;
+            };
+
+            bool p1_can_mutate = can_mutate(p1_abs, p1_state, p1_in_zone);
+            bool p2_can_mutate = can_mutate(p2_abs, p2_state, p2_in_zone);
+
+            // Local tape (128 bytes)
+            unsigned char tape[FULL_TAPE_SIZE];
+
+            // Copy programs to local tape (use 64-bit offsets)
+            unsigned long long p1_byte_offset = p1_abs * SINGLE_TAPE_SIZE;
+            unsigned long long p2_byte_offset = p2_abs * SINGLE_TAPE_SIZE;
+
+            for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                tape[i] = soup[p1_byte_offset + i];
+                tape[SINGLE_TAPE_SIZE + i] = soup[p2_byte_offset + i];
+            }
+
+            // LCG for fast mutations
+            auto lcg = [](unsigned int s) -> unsigned int {
+                return s * 1664525u + 1013904223u;
+            };
+
+            // Apply mutations with geometric skip (sparse mutation optimization)
+            unsigned int rng = (unsigned int)seed ^ (unsigned int)epoch
+                ^ (pair_idx * 0x9E3779B9u) ^ (sim_idx * 0x85EBCA6Bu);
+
+            auto mutate_sparse = [&](unsigned int start, unsigned int end) {
+                unsigned int inv_prob = (1u << 30) / (mutation_prob > 0 ? mutation_prob : 1u);
+                unsigned int byte_pos = start;
+                unsigned int end_byte = end;
+
+                rng = lcg(rng);
+                unsigned int skip = ((rng >> 8) * inv_prob) >> 22;
+                byte_pos += skip;
+
+                while (byte_pos < end_byte) {
+                    rng = lcg(rng);
+                    tape[byte_pos] = (unsigned char)((rng >> 8) & 0xFF);
+
+                    rng = lcg(rng);
+                    skip = ((rng >> 8) * inv_prob) >> 22;
+                    if (skip < 1u) { skip = 1u; }
+                    byte_pos += skip;
+                }
+            };
+
+            if (p1_can_mutate) {
+                mutate_sparse(0u, SINGLE_TAPE_SIZE);
+            }
+
+            if (p2_can_mutate) {
+                mutate_sparse(SINGLE_TAPE_SIZE, FULL_TAPE_SIZE);
+            }
+
+            // Track if copies occurred (for energy inheritance)
+            bool p1_received_copy = false;
+            bool p2_received_copy = false;
+
+            // Skip interpreter if tape is empty
+            bool tape_active = false;
+            for (int i = 0; i < FULL_TAPE_SIZE; i++) {
+                if (tape[i] != 0) {
+                    tape_active = true;
+                    break;
+                }
+            }
+
+            // BFF Evaluation
+            int pos = 2;
+            int head0 = tape[0] & (FULL_TAPE_SIZE - 1);
+            int head1 = tape[1] & (FULL_TAPE_SIZE - 1);
+
+            if (tape_active) {
+                for (unsigned int step = 0; step < steps_per_run; step++) {
+                    head0 = head0 & (FULL_TAPE_SIZE - 1);
+                    head1 = head1 & (FULL_TAPE_SIZE - 1);
+
+                    unsigned char cmd = tape[pos];
+
+                    // BFF commands as byte values: < > { } + - . , [ ]
+                    // 0x3C=60, 0x3E=62, 0x7B=123, 0x7D=125, 0x2B=43, 0x2D=45, 0x2E=46, 0x2C=44, 0x5B=91, 0x5D=93
+                    switch (cmd) {
+                        case 0x3C: head0--; ops++; break;  // '<'
+                        case 0x3E: head0++; ops++; break;  // '>'
+                        case 0x7B: head1--; ops++; break;  // '{'
+                        case 0x7D: head1++; ops++; break;  // '}'
+                        case 0x2B: tape[head0 & (FULL_TAPE_SIZE-1)]++; ops++; break;  // '+'
+                        case 0x2D: tape[head0 & (FULL_TAPE_SIZE-1)]--; ops++; break;  // '-'
+                        case 0x2E:  // '.'
+                            tape[head1 & (FULL_TAPE_SIZE-1)] = tape[head0 & (FULL_TAPE_SIZE-1)];
+                            // Track copy direction for energy
+                            if ((head0 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE &&
+                                (head1 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE) {
+                                p2_received_copy = true;
+                            } else if ((head0 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE &&
+                                       (head1 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE) {
+                                p1_received_copy = true;
+                            }
+                            ops++;
+                            break;
+                        case 0x2C:  // ','
+                            tape[head0 & (FULL_TAPE_SIZE-1)] = tape[head1 & (FULL_TAPE_SIZE-1)];
+                            // Track copy direction for energy
+                            if ((head1 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE &&
+                                (head0 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE) {
+                                p2_received_copy = true;
+                            } else if ((head1 & (FULL_TAPE_SIZE-1)) >= SINGLE_TAPE_SIZE &&
+                                       (head0 & (FULL_TAPE_SIZE-1)) < SINGLE_TAPE_SIZE) {
+                                p1_received_copy = true;
+                            }
+                            ops++;
+                            break;
+                        case 0x5B:  // '['
+                            if (tape[head0 & (FULL_TAPE_SIZE-1)] == 0) {
+                                int depth = 1;
+                                pos++;
+                                while (pos < FULL_TAPE_SIZE && depth > 0) {
+                                    if (tape[pos] == 0x5D) depth--;  // ']'
+                                    if (tape[pos] == 0x5B) depth++;  // '['
+                                    pos++;
+                                }
+                                pos--;
+                                if (depth != 0) pos = FULL_TAPE_SIZE;
+                            }
+                            ops++;
+                            break;
+                        case 0x5D:  // ']'
+                            if (tape[head0 & (FULL_TAPE_SIZE-1)] != 0) {
+                                int depth = 1;
+                                pos--;
+                                while (pos >= 0 && depth > 0) {
+                                    if (tape[pos] == 0x5D) depth++;  // ']'
+                                    if (tape[pos] == 0x5B) depth--;  // '['
+                                    pos--;
+                                }
+                                pos++;
+                                if (depth != 0) pos = -1;
+                            }
+                            ops++;
+                            break;
+                    }
+
+                    if (pos < 0) break;
+                    pos++;
+                    if (pos >= FULL_TAPE_SIZE) break;
+                }
+            }
+
+            // Update energy states
+            bool p1_stays_dead = false;
+            bool p2_stays_dead = false;
+
+            if (energy_enabled) {
+                // P1 energy update
+                unsigned int p1_reserve = get_reserve(p1_state);
+                unsigned int p1_timer = get_timer(p1_state);
+                bool p1_dead = p1_was_dead;
+
+                if (p1_in_zone) {
+                    p1_reserve = p1_reserve_duration;
+                    p1_timer = 0;
+                } else if (p1_received_copy) {
+                    p1_reserve = p2_in_zone ? p2_reserve_duration : get_reserve(p2_state);
+                    p1_timer = 0;
+                    p1_dead = false;
+                } else {
+                    if (p1_reserve > 0) p1_reserve--;
+                    if (!p1_dead) p1_timer++;
+                    // death_timer = 0 means infinite (never dies)
+                    if (p1_death_timer > 0 && p1_timer > p1_death_timer && !p1_dead) {
+                        p1_dead = true;
+                    }
+                }
+                p1_stays_dead = p1_was_dead && p1_dead;
+                energy_state[p1_abs] = pack_state(p1_reserve, p1_timer, p1_dead);
+
+                // P2 energy update
+                unsigned int p2_reserve = get_reserve(p2_state);
+                unsigned int p2_timer = get_timer(p2_state);
+                bool p2_dead = p2_was_dead;
+
+                if (p2_in_zone) {
+                    p2_reserve = p2_reserve_duration;
+                    p2_timer = 0;
+                } else if (p2_received_copy) {
+                    p2_reserve = p1_in_zone ? p1_reserve_duration : get_reserve(p1_state);
+                    p2_timer = 0;
+                    p2_dead = false;
+                } else {
+                    if (p2_reserve > 0) p2_reserve--;
+                    if (!p2_dead) p2_timer++;
+                    if (p2_death_timer > 0 && p2_timer > p2_death_timer && !p2_dead) {
+                        p2_dead = true;
+                    }
+                }
+                p2_stays_dead = p2_was_dead && p2_dead;
+                energy_state[p2_abs] = pack_state(p2_reserve, p2_timer, p2_dead);
+            }
+
+            // Write back soup
+            if (p1_stays_dead) {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p1_byte_offset + i] = 0;
+                }
+            } else if (energy_enabled && is_dead(energy_state[p1_abs])) {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p1_byte_offset + i] = 0;
+                }
+            } else {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p1_byte_offset + i] = tape[i];
+                }
+            }
+
+            if (p2_stays_dead) {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p2_byte_offset + i] = 0;
+                }
+            } else if (energy_enabled && is_dead(energy_state[p2_abs])) {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p2_byte_offset + i] = 0;
+                }
+            } else {
+                for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                    soup[p2_byte_offset + i] = tape[SINGLE_TAPE_SIZE + i];
+                }
+            }
         }
     }
-    
-    // Atomic add to total ops
-    atomicAdd(ops_count, (unsigned long long)ops);
+
+    // Per-block reduction for ops counter (all threads must participate)
+    // This reduces atomic contention from ~65K atomics to ~256 atomics
+    block_ops[tid] = (unsigned long long)ops;
+    __syncthreads();
+
+    // Tree reduction within block
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            block_ops[tid] += block_ops[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Only thread 0 does the atomic add to global counter
+    if (tid == 0) {
+        atomicAdd(ops_count, block_ops[0]);
+    }
 }
 "#;
 
@@ -330,7 +526,11 @@ pub struct CudaMultiSimulation {
     energy_state_gpu: CudaSlice<u32>,
     sim_configs_gpu: CudaSlice<u32>,
     energy_map_gpu: CudaSlice<u32>,
-    ops_count_gpu: CudaSlice<u64>,
+    // Double-buffered ops counters for async readback
+    ops_count_gpu_a: CudaSlice<u64>,
+    ops_count_gpu_b: CudaSlice<u64>,
+    ops_write_to_a: bool,  // true = kernel writes to A, read from B
+    last_ops: u64,         // cached ops from previous epoch
     kernel: CudaFunction,
     // Config
     num_sims: usize,
@@ -343,6 +543,8 @@ pub struct CudaMultiSimulation {
     seed: u64,
     epoch: u64,
     energy_enabled: bool,
+    mega_mode: bool,
+    pending_readback: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -387,7 +589,9 @@ impl CudaMultiSimulation {
         
         // Initialize data on CPU first
         let num_pairs = num_programs / 2;
-        let energy_enabled = energy_config.map(|c| c.enabled).unwrap_or(false);
+        let energy_enabled = energy_config
+            .map(|c| c.enabled && !c.sources.is_empty())
+            .unwrap_or(false);
         let default_death = energy_config.map(|c| c.interaction_death).unwrap_or(10);
         let default_reserve = energy_config.map(|c| c.reserve_duration).unwrap_or(5);
         
@@ -414,8 +618,14 @@ impl CudaMultiSimulation {
             }
         };
         
-        // Energy map (all zeros for now)
-        let energy_map = vec![0u32; (total_programs + 31) / 32];
+        // Energy map (precomputed zones, with per-sim offsets)
+        let energy_map = compute_energy_map(
+            energy_config,
+            num_programs,
+            num_sims,
+            grid_width,
+            grid_height,
+        );
         
         // Soup with random data
         use rand::Rng;
@@ -424,7 +634,7 @@ impl CudaMultiSimulation {
         
         
         // Energy states (all alive with full reserve)
-        let packed_initial_state = (default_reserve.min(65535) & 0xFFFF) as u32;
+        let packed_initial_state = 0u32;
         let energy_states: Vec<u32> = vec![packed_initial_state; total_programs];
         
         // Allocate AND initialize GPU buffers using htod_sync_copy (copies data in one step)
@@ -433,8 +643,10 @@ impl CudaMultiSimulation {
         let energy_state_gpu = device.htod_sync_copy(&energy_states)?;
         let sim_configs_gpu = device.htod_sync_copy(&sim_configs)?;
         let energy_map_gpu = device.htod_sync_copy(&energy_map)?;
-        let ops_count_gpu = device.alloc_zeros::<u64>(1)?;
-        
+        // Double-buffered ops counters for async readback
+        let ops_count_gpu_a = device.alloc_zeros::<u64>(1)?;
+        let ops_count_gpu_b = device.alloc_zeros::<u64>(1)?;
+
         Ok(Self {
             device,
             soup_gpu,
@@ -442,7 +654,10 @@ impl CudaMultiSimulation {
             energy_state_gpu,
             sim_configs_gpu,
             energy_map_gpu,
-            ops_count_gpu,
+            ops_count_gpu_a,
+            ops_count_gpu_b,
+            ops_write_to_a: true,
+            last_ops: 0,
             kernel,
             num_sims,
             num_programs,
@@ -454,29 +669,45 @@ impl CudaMultiSimulation {
             seed,
             epoch: 0,
             energy_enabled,
+            mega_mode: false,
+            pending_readback: None,
         })
     }
     
     /// Run one epoch across all simulations
+    /// Uses double-buffered ops counter for async readback - returns previous epoch's ops
+    /// (returns 0 on first epoch since there's no previous data)
     pub fn step(&mut self) -> u64 {
         // Calculate grid dimensions
-        let total_pairs = self.num_pairs * self.num_sims;
+        let total_pairs = if self.mega_mode {
+            self.num_pairs
+        } else {
+            self.num_pairs * self.num_sims
+        };
         let block_size = 256u32;
         let grid_size = ((total_pairs as u32) + block_size - 1) / block_size;
-        
-        
-        // Launch kernel with 11 params (cudarc limit is 12)
+
         // Pack some u32 params together into u64 values for the kernel
         let params_packed1 = ((self.num_pairs as u64) << 32) | (self.num_programs as u64);
         let params_packed2 = ((self.num_sims as u64) << 32) | (self.steps_per_run as u64);
-        let params_packed3 = ((self.mutation_prob as u64) << 32) | (if self.energy_enabled { 1u64 } else { 0u64 });
-        
+        let flags = (if self.energy_enabled { 1u64 } else { 0u64 })
+            | (if self.mega_mode { 2u64 } else { 0u64 });
+        let params_packed3 = ((self.mutation_prob as u64) << 32) | flags;
+
         let cfg = LaunchConfig {
             block_dim: (block_size, 1, 1),
             grid_dim: (grid_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        
+
+        // Select which buffer to write to and which to read from
+        let (write_buf, read_buf) = if self.ops_write_to_a {
+            (&self.ops_count_gpu_a, &self.ops_count_gpu_b)
+        } else {
+            (&self.ops_count_gpu_b, &self.ops_count_gpu_a)
+        };
+
+        // Launch kernel writing to current buffer
         unsafe {
             self.kernel.clone().launch(cfg, (
                 &self.soup_gpu,
@@ -484,7 +715,7 @@ impl CudaMultiSimulation {
                 &self.energy_state_gpu,
                 &self.sim_configs_gpu,
                 &self.energy_map_gpu,
-                &self.ops_count_gpu,
+                write_buf,
                 params_packed1,
                 params_packed2,
                 params_packed3,
@@ -492,29 +723,48 @@ impl CudaMultiSimulation {
                 self.epoch,
             )).expect("Kernel launch failed");
         }
-        
-        // Sync and check for errors (kernel errors are caught here)
+
+        // Start async read of the OTHER buffer (previous epoch's data)
+        // This overlaps with kernel execution
+        let mut ops = [0u64];
+        if self.epoch > 0 {
+            // Use async copy - overlaps with kernel execution
+            let device_ptr = *read_buf.device_ptr();
+            let stream = *self.device.cu_stream();
+            unsafe {
+                // Start async copy while kernel is still running
+                let _ = result::memcpy_dtoh_async(&mut ops, device_ptr, stream);
+            }
+        }
+
+        // Sync and check for errors (kernel errors are caught here, also completes async copy)
         match self.device.synchronize() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("CUDA sync error at epoch {}: {:?}", self.epoch, e);
-                return 0;
+                return self.last_ops;
             }
         }
-        
-        self.epoch += 1;
-        
-        // Read ops count
-        let mut ops = [0u64];
-        self.device.dtoh_sync_copy_into(&self.ops_count_gpu, &mut ops).unwrap();
-        
-        
-        // Reset counter for next epoch using memset
-        if let Err(e) = self.device.memset_zeros(&mut self.ops_count_gpu) {
-            eprintln!("Failed to reset ops counter: {:?}", e);
+
+        // Reset the read buffer for next use (it will be written to after we swap)
+        if self.epoch > 0 {
+            let read_buf_mut = if self.ops_write_to_a {
+                &mut self.ops_count_gpu_b
+            } else {
+                &mut self.ops_count_gpu_a
+            };
+            if let Err(e) = self.device.memset_zeros(read_buf_mut) {
+                eprintln!("Failed to reset ops counter: {:?}", e);
+            }
         }
-        
-        ops[0]
+
+        // Swap buffers for next epoch
+        self.ops_write_to_a = !self.ops_write_to_a;
+        self.epoch += 1;
+
+        // Cache and return the ops (from previous epoch, or 0 if first epoch)
+        self.last_ops = ops[0];
+        self.last_ops
     }
     
     /// Get soup data for a specific simulation
@@ -538,12 +788,123 @@ impl CudaMultiSimulation {
         self.device.dtoh_sync_copy_into(&self.soup_gpu, &mut data).unwrap();
         data
     }
+
+    /// Begin async readback of all soup data. Use finish_async_readback to retrieve it.
+    pub fn begin_async_readback(&mut self) {
+        if self.pending_readback.is_some() {
+            return;
+        }
+
+        let size = self.soup_gpu.len();
+        let mut data = vec![0u8; size];
+
+        if let Err(e) = self.device.bind_to_thread() {
+            eprintln!("CUDA readback bind error: {:?}", e);
+            return;
+        }
+
+        let device_ptr = *self.soup_gpu.device_ptr();
+        let stream = *self.device.cu_stream();
+        unsafe {
+            if let Err(e) = result::memcpy_dtoh_async(&mut data, device_ptr, stream) {
+                eprintln!("CUDA async readback failed: {:?}", e);
+                return;
+            }
+        }
+
+        self.pending_readback = Some(data);
+    }
+
+    /// Returns true if async readback data is pending.
+    pub fn has_pending_readback(&self) -> bool {
+        self.pending_readback.is_some()
+    }
+
+    /// Finish async readback and return soup data, or None if not pending.
+    pub fn finish_async_readback(&mut self) -> Option<Vec<u8>> {
+        let data = self.pending_readback.take()?;
+        if let Err(e) = self.device.synchronize() {
+            eprintln!("CUDA readback sync error: {:?}", e);
+            return None;
+        }
+        Some(data)
+    }
+
+    /// Get all soup data using async readback if pending, otherwise sync.
+    pub fn get_all_soup_async(&mut self) -> Vec<u8> {
+        if self.pending_readback.is_some() {
+            self.finish_async_readback().unwrap_or_else(|| self.get_all_soup())
+        } else {
+            self.get_all_soup()
+        }
+    }
+
+    pub fn get_all_energy_states(&self) -> Vec<u32> {
+        let size = self.num_sims * self.num_programs;
+        let mut data = vec![0u32; size];
+        self.device.dtoh_sync_copy_into(&self.energy_state_gpu, &mut data).unwrap();
+        data
+    }
+
+    /// Restore soup data from checkpoint
+    pub fn set_all_soup(&mut self, soup: &[u8]) {
+        if let Err(e) = self.device.htod_sync_copy_into(soup, &mut self.soup_gpu) {
+            eprintln!("CUDA soup restore failed: {:?}", e);
+        }
+    }
+
+    /// Restore energy states from checkpoint
+    pub fn set_all_energy_states(&mut self, energy_states: &[u32]) {
+        if let Err(e) = self.device.htod_sync_copy_into(energy_states, &mut self.energy_state_gpu) {
+            eprintln!("CUDA energy restore failed: {:?}", e);
+        }
+    }
+
+    /// Set pairs (local indices) for all simulations
+    pub fn set_pairs_all(&mut self, pairs: &[(u32, u32)]) {
+        let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        self.pairs_gpu = self.device.htod_sync_copy(&flat).unwrap();
+        self.num_pairs = pairs.len();
+    }
+
+    /// Enable/disable mega-simulation mode (pairs are absolute indices)
+    pub fn set_mega_mode(&mut self, enabled: bool) {
+        self.mega_mode = enabled;
+    }
+
+    /// Set pairs for mega mode (absolute indices across all sims)
+    pub fn set_pairs_mega(&mut self, pairs: &[(u32, u32)]) {
+        let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        self.pairs_gpu = self.device.htod_sync_copy(&flat).unwrap();
+        self.num_pairs = pairs.len();
+    }
     
     pub fn num_sims(&self) -> usize { self.num_sims }
     pub fn num_programs(&self) -> usize { self.num_programs }
     pub fn grid_width(&self) -> usize { self.grid_width }
     pub fn grid_height(&self) -> usize { self.grid_height }
     pub fn epoch(&self) -> u64 { self.epoch }
+    pub fn set_epoch(&mut self, epoch: u64) { self.epoch = epoch; }
+
+    /// Update energy configuration (recomputes energy map on GPU)
+    /// Call this when energy sources change dynamically
+    pub fn update_energy_config(&mut self, config: &crate::energy::EnergyConfig) {
+        let energy_map = compute_energy_map(
+            Some(config),
+            self.num_programs,
+            self.num_sims,
+            self.grid_width,
+            self.grid_height,
+        );
+
+        // Upload new energy map to GPU
+        if let Err(e) = self.device.htod_sync_copy_into(&energy_map, &mut self.energy_map_gpu) {
+            eprintln!("CUDA energy map update failed: {:?}", e);
+        }
+
+        // Update enabled flag
+        self.energy_enabled = config.enabled && !config.sources.is_empty();
+    }
 }
 
 /// Check if CUDA is available
@@ -576,4 +937,3 @@ pub fn print_cuda_info() {
     println!("CUDA: Not compiled with CUDA support");
     println!("  To enable: cargo build --release --features cuda");
 }
-
