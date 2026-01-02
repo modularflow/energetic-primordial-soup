@@ -330,7 +330,7 @@ struct EnergyParams {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> ops_count: atomic<u32>;
 @group(0) @binding(4) var<uniform> energy_params: EnergyParams;
-@group(0) @binding(5) var<storage, read_write> energy_state: array<u32>; // packed: reserve(8) | timer(8) | dead(8) | unused(8)
+@group(0) @binding(5) var<storage, read_write> energy_state: array<u32>; // packed: reserve(16) | timer(15) | dead(1)
 
 // Simple 32-bit LCG for mutations (faster than 64-bit splitmix on GPU)
 fn lcg(seed: u32) -> u32 {
@@ -406,13 +406,15 @@ fn in_energy_zone(prog_idx: u32) -> bool {
 }
 
 // Get energy state components
-fn get_reserve(state: u32) -> u32 { return state & 0xFFu; }
-fn get_timer(state: u32) -> u32 { return (state >> 8u) & 0xFFu; }
-fn is_dead(state: u32) -> bool { return ((state >> 16u) & 0xFFu) != 0u; }
+// Energy state packing: reserve(16 bits) | timer(15 bits) | dead(1 bit)
+// This allows death_epochs up to 32767 (vs 255 with 8-bit packing)
+fn get_reserve(state: u32) -> u32 { return state & 0xFFFFu; }
+fn get_timer(state: u32) -> u32 { return (state >> 16u) & 0x7FFFu; }
+fn is_dead(state: u32) -> bool { return (state >> 31u) != 0u; }
 
 // Pack energy state
 fn pack_state(reserve: u32, timer: u32, dead: bool) -> u32 {
-    return (reserve & 0xFFu) | ((timer & 0xFFu) << 8u) | (select(0u, 1u, dead) << 16u);
+    return (reserve & 0xFFFFu) | ((timer & 0x7FFFu) << 16u) | (select(0u, 1u, dead) << 31u);
 }
 
 // Check if program can mutate
@@ -710,13 +712,51 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         energy_state[p2_idx] = pack_state(p2_reserve, p2_timer, p2_dead);
     }
     
+    // Spontaneous generation: dead tapes in energy zones have a chance to spawn new random programs
+    var p1_spawned = false;
+    var p2_spawned = false;
+    
+    if (energy_params.enabled != 0u && energy_params.spontaneous_rate > 0u) {
+        // P1: Check for spontaneous generation
+        if (p1_stays_dead && p1_in_zone) {
+            rng_state = lcg(rng_state);
+            if (rng_state % energy_params.spontaneous_rate == 0u) {
+                // Spawn new random program!
+                for (var i = 0u; i < 16u; i++) {
+                    rng_state = lcg(rng_state);
+                    tape[i] = rng_state;
+                }
+                // Revive the program
+                energy_state[p1_idx] = pack_state(energy_params.reserve_duration, 0u, false);
+                p1_spawned = true;
+                p1_stays_dead = false;
+            }
+        }
+        
+        // P2: Check for spontaneous generation
+        if (p2_stays_dead && p2_in_zone) {
+            rng_state = lcg(rng_state);
+            if (rng_state % energy_params.spontaneous_rate == 0u) {
+                // Spawn new random program!
+                for (var i = 0u; i < 16u; i++) {
+                    rng_state = lcg(rng_state);
+                    tape[i + 16u] = rng_state;
+                }
+                // Revive the program
+                energy_state[p2_idx] = pack_state(energy_params.reserve_duration, 0u, false);
+                p2_spawned = true;
+                p2_stays_dead = false;
+            }
+        }
+    }
+    
     // Copy results back to global soup
-    // Dead tapes that weren't revived stay zeroed
+    // Dead tapes that weren't revived stay zeroed (unless spontaneously spawned)
     if (p1_stays_dead) {
         for (var i = 0u; i < 16u; i++) {
             soup[p1_base + i] = 0u;
         }
-    } else if (is_dead(energy_state[p1_idx])) {
+    } else if (is_dead(energy_state[p1_idx]) && !p1_spawned) {
         // Just died this epoch - zero the tape
         for (var i = 0u; i < 16u; i++) {
             soup[p1_base + i] = 0u;
@@ -731,7 +771,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var i = 0u; i < 16u; i++) {
             soup[p2_base + i] = 0u;
         }
-    } else if (is_dead(energy_state[p2_idx])) {
+    } else if (is_dead(energy_state[p2_idx]) && !p2_spawned) {
         // Just died this epoch - zero the tape
         for (var i = 0u; i < 16u; i++) {
             soup[p2_base + i] = 0u;
@@ -1354,10 +1394,50 @@ fn main(
         energy_state[p2_abs] = pack_state(p2_reserve, p2_timer, p2_dead);
     }
     
-    // Write back soup - dead tapes stay zeroed
+    // Spontaneous generation: dead tapes in energy zones have a chance to spawn new random programs
+    var p1_spawned = false;
+    var p2_spawned = false;
+    
+    if (energy_params.enabled != 0u && energy_params.spontaneous_rate > 0u) {
+        // P1: Check for spontaneous generation
+        if (p1_stays_dead && p1_in_zone) {
+            rng_state = lcg(rng_state);
+            if (rng_state % energy_params.spontaneous_rate == 0u) {
+                // Spawn new random program!
+                for (var i = 0u; i < 16u; i++) {
+                    rng_state = lcg(rng_state);
+                    tape[i] = rng_state;
+                }
+                // Revive the program with per-sim reserve duration
+                let p1_reserve_dur = get_sim_reserve_duration(p1_sim);
+                energy_state[p1_abs] = pack_state(p1_reserve_dur, 0u, false);
+                p1_spawned = true;
+                p1_stays_dead = false;
+            }
+        }
+        
+        // P2: Check for spontaneous generation
+        if (p2_stays_dead && p2_in_zone) {
+            rng_state = lcg(rng_state);
+            if (rng_state % energy_params.spontaneous_rate == 0u) {
+                // Spawn new random program!
+                for (var i = 0u; i < 16u; i++) {
+                    rng_state = lcg(rng_state);
+                    tape[i + 16u] = rng_state;
+                }
+                // Revive the program with per-sim reserve duration
+                let p2_reserve_dur = get_sim_reserve_duration(p2_sim);
+                energy_state[p2_abs] = pack_state(p2_reserve_dur, 0u, false);
+                p2_spawned = true;
+                p2_stays_dead = false;
+            }
+        }
+    }
+    
+    // Write back soup - dead tapes stay zeroed (unless spontaneously spawned)
     if (p1_stays_dead) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
-    } else if (is_dead(energy_state[p1_abs])) {
+    } else if (is_dead(energy_state[p1_abs]) && !p1_spawned) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = tape[i]; }
@@ -1365,7 +1445,7 @@ fn main(
     
     if (p2_stays_dead) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
-    } else if (is_dead(energy_state[p2_abs])) {
+    } else if (is_dead(energy_state[p2_abs]) && !p2_spawned) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = tape[i + 16u]; }
@@ -1768,7 +1848,7 @@ fn main(
             self.queue.write_buffer(&self.soup_buffer, 0, &soup);
             
             // Initialize energy state: all programs start alive with full reserve if in zone
-            // Format: reserve(8) | timer(8) | dead(8) | unused(8)
+            // Format: reserve(16) | timer(15) | dead(1)
             let energy_state: Vec<u32> = (0..self.num_programs)
                 .map(|_| {
                     // Start with reserve = reserve_duration, timer = 0, dead = false

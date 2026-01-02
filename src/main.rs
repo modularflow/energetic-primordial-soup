@@ -6,6 +6,7 @@ mod energy;
 mod fitness;
 mod gpu;
 mod islands;
+mod metrics;
 mod simulation;
 
 use bff::SINGLE_TAPE_SIZE;
@@ -32,6 +33,9 @@ pub struct Config {
     pub energy: EnergySettings,
     /// Checkpoint settings
     pub checkpoint: CheckpointConfig,
+    /// Metrics settings (compression ratio tracking for phase transitions)
+    #[serde(default)]
+    pub metrics: MetricsSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +153,31 @@ pub struct DynamicEnergySettings {
     pub spawn_rate: usize,
 }
 
+/// Metrics settings for tracking phase transitions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsSettings {
+    /// Enable metrics collection (Brotli compression ratio tracking)
+    pub enabled: bool,
+    /// Collect metrics every N epochs
+    pub interval: usize,
+    /// Path to CSV output file (optional, metrics also printed to stdout)
+    pub output_file: String,
+    /// Brotli compression quality (1-11, lower = faster, default 4)
+    pub brotli_quality: u32,
+}
+
+impl Default for MetricsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: 1000,
+            output_file: String::new(),
+            brotli_quality: 4,
+        }
+    }
+}
+
 impl Default for GridConfig {
     fn default() -> Self {
         Self { width: 512, height: 256 }
@@ -216,19 +245,34 @@ impl Default for EnergySettings {
 impl EnergySettings {
     /// Expand sim_groups into per-simulation configs (death_timer, reserve_duration pairs)
     /// Returns a Vec of (death_timer, reserve_duration) for each simulation
+    /// 
+    /// # Behavior
+    /// - Groups with explicit `count` are allocated first (capped to remaining sims)
+    /// - Groups without `count` split the remaining sims evenly
+    /// - Any remaining sims after all groups use global defaults
+    /// - Warns if total explicit counts exceed num_sims
     pub fn expand_sim_configs(&self, num_sims: usize) -> Vec<(u32, u32)> {
+        if num_sims == 0 {
+            return Vec::new();
+        }
+        
         if self.sim_groups.is_empty() {
             // No groups defined - all sims use global values
             return vec![(self.death_epochs, self.reserve_epochs); num_sims];
         }
         
         let mut configs = Vec::with_capacity(num_sims);
-        let mut remaining_sims = num_sims;
         
         // First pass: count sims with explicit counts
         let explicit_count: usize = self.sim_groups.iter()
             .filter_map(|g| g.count)
             .sum();
+        
+        // Warn if explicit counts exceed total sims
+        if explicit_count > num_sims {
+            eprintln!("Warning: sim_groups explicit counts ({}) exceed parallel_sims ({}). Some groups will be truncated.", 
+                explicit_count, num_sims);
+        }
         
         // Groups without explicit counts split the remaining sims evenly
         let groups_without_count = self.sim_groups.iter()
@@ -241,18 +285,32 @@ impl EnergySettings {
         } else {
             0
         };
-        let mut extra = if groups_without_count > 0 {
+        
+        // Distribute remainder across groups without explicit counts (first groups get extras)
+        let mut extra_sims = if groups_without_count > 0 {
             remaining_after_explicit % groups_without_count
         } else {
             0
         };
         
+        let mut remaining_sims = num_sims;
+        
         for group in &self.sim_groups {
+            if remaining_sims == 0 {
+                break; // No more sims to allocate
+            }
+            
             let count = match group.count {
                 Some(c) => c.min(remaining_sims),
                 None => {
-                    let c = per_group_default + if extra > 0 { extra = extra.saturating_sub(1); 1 } else { 0 };
-                    c.min(remaining_sims)
+                    // Distribute evenly with extras going to first groups
+                    let extra_for_this = if extra_sims > 0 { 
+                        extra_sims -= 1; 
+                        1 
+                    } else { 
+                        0 
+                    };
+                    (per_group_default + extra_for_this).min(remaining_sims)
                 }
             };
             
@@ -264,8 +322,12 @@ impl EnergySettings {
         }
         
         // Fill any remaining sims with global defaults
-        while configs.len() < num_sims {
-            configs.push((self.death_epochs, self.reserve_epochs));
+        if remaining_sims > 0 {
+            eprintln!("Note: {} sims not covered by sim_groups, using global defaults (death_epochs={}, reserve_epochs={})",
+                remaining_sims, self.death_epochs, self.reserve_epochs);
+            for _ in 0..remaining_sims {
+                configs.push((self.death_epochs, self.reserve_epochs));
+            }
         }
         
         configs
@@ -291,6 +353,7 @@ impl Default for Config {
             output: OutputConfig::default(),
             energy: EnergySettings::default(),
             checkpoint: CheckpointConfig::default(),
+            metrics: MetricsSettings::default(),
         }
     }
 }
@@ -310,6 +373,108 @@ impl Config {
         Ok(())
     }
     
+    /// Validate configuration and return errors/warnings
+    /// Returns Err if there are fatal configuration errors
+    pub fn validate(&self) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
+        
+        // Check grid dimensions
+        if self.grid.width == 0 || self.grid.height == 0 {
+            return Err("Grid dimensions must be non-zero".to_string());
+        }
+        
+        // Check parallel_layout matches parallel_sims when border_interaction is enabled
+        let [layout_cols, layout_rows] = self.simulation.parallel_layout;
+        let layout_product = layout_cols * layout_rows;
+        
+        if self.simulation.border_interaction {
+            if layout_product != self.simulation.parallel_sims {
+                return Err(format!(
+                    "parallel_layout [{}, {}] = {} does not match parallel_sims = {}. \
+                    When border_interaction is enabled, layout must multiply to parallel_sims.",
+                    layout_cols, layout_rows, layout_product, self.simulation.parallel_sims
+                ));
+            }
+            if layout_cols <= 1 && layout_rows <= 1 {
+                return Err(
+                    "border_interaction requires parallel_layout with at least 2 rows or columns".to_string()
+                );
+            }
+        } else if layout_product != self.simulation.parallel_sims && layout_product > 1 {
+            warnings.push(format!(
+                "parallel_layout [{}, {}] = {} differs from parallel_sims = {}. \
+                This is only meaningful when border_interaction is enabled.",
+                layout_cols, layout_rows, layout_product, self.simulation.parallel_sims
+            ));
+        }
+        
+        // Check mutation_rate
+        if self.simulation.mutation_rate == 0 {
+            warnings.push("mutation_rate is 0, will be treated as 1 (maximum mutation)".to_string());
+        }
+        
+        // Check energy radius vs grid size
+        if self.energy.enabled {
+            let min_dim = self.grid.width.min(self.grid.height);
+            if self.energy.radius * 2 >= min_dim {
+                warnings.push(format!(
+                    "energy radius {} is large relative to grid size {}x{}. \
+                    Sources may overlap significantly.",
+                    self.energy.radius, self.grid.width, self.grid.height
+                ));
+            }
+            
+            // Check death_epochs fits in 15 bits (max 32767)
+            if self.energy.death_epochs > 32767 {
+                return Err(format!(
+                    "death_epochs {} exceeds maximum of 32767 (15-bit limit in GPU state packing)",
+                    self.energy.death_epochs
+                ));
+            }
+            
+            // Check reserve_epochs fits in 16 bits (max 65535)
+            if self.energy.reserve_epochs > 65535 {
+                return Err(format!(
+                    "reserve_epochs {} exceeds maximum of 65535 (16-bit limit in GPU state packing)",
+                    self.energy.reserve_epochs
+                ));
+            }
+            
+            // Also check sim_groups for out-of-range values
+            for (i, group) in self.energy.sim_groups.iter().enumerate() {
+                if group.death_epochs > 32767 {
+                    return Err(format!(
+                        "sim_groups[{}].death_epochs {} exceeds maximum of 32767",
+                        i, group.death_epochs
+                    ));
+                }
+                if let Some(reserve) = group.reserve_epochs {
+                    if reserve > 65535 {
+                        return Err(format!(
+                            "sim_groups[{}].reserve_epochs {} exceeds maximum of 65535",
+                            i, reserve
+                        ));
+                    }
+                }
+            }
+        }
+        
+        // Check steps_per_run is reasonable
+        if self.simulation.steps_per_run == 0 {
+            return Err("steps_per_run must be greater than 0".to_string());
+        }
+        
+        // Check frame_interval
+        if self.output.frame_interval > self.simulation.max_epochs {
+            warnings.push(format!(
+                "frame_interval {} is greater than max_epochs {}, no frames will be saved",
+                self.output.frame_interval, self.simulation.max_epochs
+            ));
+        }
+        
+        Ok(warnings)
+    }
+    
     /// Generate a template config file
     pub fn write_template(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let config = Config::default();
@@ -317,8 +482,10 @@ impl Config {
     }
     
     /// Convert mutation_rate (1/N) to internal mutation_prob
+    /// Returns max probability if mutation_rate is 0 (prevents division by zero)
     pub fn mutation_prob(&self) -> u32 {
-        ((1u64 << 30) / self.simulation.mutation_rate as u64) as u32
+        let rate = self.simulation.mutation_rate.max(1);
+        ((1u64 << 30) / rate as u64) as u32
     }
 }
 
@@ -369,6 +536,11 @@ struct Args {
     energy_spawn_rate: usize,
     // Per-simulation energy configs (for running different death_epochs in same run)
     energy_sim_groups: Vec<SimGroupConfig>,
+    // Metrics options (compression ratio tracking for phase transitions)
+    metrics_enabled: bool,
+    metrics_interval: usize,
+    metrics_output_file: String,
+    metrics_brotli_quality: u32,
 }
 
 impl Default for Args {
@@ -416,6 +588,11 @@ impl Default for Args {
             energy_spawn_rate: 0,       // 0 = disabled
             // Per-sim configs
             energy_sim_groups: Vec::new(),
+            // Metrics defaults
+            metrics_enabled: false,
+            metrics_interval: 1000,
+            metrics_output_file: String::new(),
+            metrics_brotli_quality: 4,
         }
     }
 }
@@ -459,6 +636,11 @@ impl From<Config> for Args {
             energy_source_lifetime: c.energy.dynamic.source_lifetime,
             energy_spawn_rate: c.energy.dynamic.spawn_rate,
             energy_sim_groups: c.energy.sim_groups.clone(),
+            // Metrics
+            metrics_enabled: c.metrics.enabled,
+            metrics_interval: c.metrics.interval,
+            metrics_output_file: c.metrics.output_file,
+            metrics_brotli_quality: c.metrics.brotli_quality,
         }
     }
 }
@@ -477,6 +659,20 @@ fn parse_args() -> Args {
                 match Config::from_yaml(config_path) {
                     Ok(config) => {
                         println!("Loaded config from: {}", config_path);
+                        
+                        // Validate configuration
+                        match config.validate() {
+                            Ok(warnings) => {
+                                for warning in warnings {
+                                    eprintln!("Config warning: {}", warning);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Config validation error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                        
                         args = Args::from(config);
                     }
                     Err(e) => {
@@ -947,6 +1143,13 @@ fn main() {
                         &args.raw_dir,
                         args.async_save,
                         gpu_energy_config,
+                        args.neighbor_range,
+                        metrics::MetricsConfig {
+                            enabled: args.metrics_enabled,
+                            interval: args.metrics_interval,
+                            output_path: if args.metrics_output_file.is_empty() { None } else { Some(args.metrics_output_file.clone()) },
+                            brotli_quality: args.metrics_brotli_quality,
+                        },
                     );
                     return;
                 }
@@ -1003,6 +1206,12 @@ fn main() {
                     save_raw,
                     &args.raw_dir,
                     args.async_save,
+                    metrics::MetricsConfig {
+                        enabled: args.metrics_enabled,
+                        interval: args.metrics_interval,
+                        output_path: if args.metrics_output_file.is_empty() { None } else { Some(args.metrics_output_file.clone()) },
+                        brotli_quality: args.metrics_brotli_quality,
+                    },
                 );
                 return;
             }
@@ -1031,6 +1240,7 @@ fn main() {
                 args.frame_interval,
                 args.neighbor_range,
                 args.auto_terminate_dead_epochs,
+                args.seed,
             );
             if !completed {
                 std::process::exit(2); // Exit code 2 = terminated early
@@ -1192,6 +1402,8 @@ fn run_cuda_simulation(
     raw_dir: &str,
     async_save: bool,
     mut energy_config: Option<energy::EnergyConfig>,
+    neighbor_range: usize,
+    metrics_config: metrics::MetricsConfig,
 ) {
     use std::time::Instant;
     
@@ -1270,9 +1482,47 @@ fn run_cuda_simulation(
     let mut last_print = Instant::now();
     let mut last_checkpoint = start_epoch;
     
+    let num_programs = cuda_sim.num_programs();
+    
+    // Create metrics tracker if enabled
+    let mut metrics_tracker = if metrics_config.enabled {
+        match metrics::MetricsTracker::new(metrics_config.clone()) {
+            Ok(tracker) => {
+                println!("Metrics tracking: ENABLED (interval: {} epochs)", metrics_config.interval);
+                if !metrics_config.output_path.as_ref().map_or(true, |p| p.is_empty()) {
+                    println!("  Output file: {}", metrics_config.output_path.as_ref().unwrap());
+                }
+                Some(tracker)
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not create metrics tracker: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    
     println!("Running {} epochs across {} simulations...", max_epochs - start_epoch, num_sims);
     
+    let layout_cols = parallel_layout[0];
+    let layout_rows = parallel_layout[1];
+    
     for epoch in start_epoch..max_epochs {
+        // Regenerate pairs for this epoch (dynamic pairing for more variety)
+        if mega_mode {
+            let pairs = generate_mega_pairs_seeded(
+                num_programs, grid_width, grid_height, neighbor_range,
+                num_sims, layout_cols, layout_rows, seed, epoch
+            );
+            cuda_sim.set_pairs_mega(&pairs);
+        } else {
+            let pairs = generate_2d_pairs_seeded(
+                num_programs, grid_width, grid_height, neighbor_range, seed, epoch
+            );
+            cuda_sim.set_pairs_all(&pairs);
+        }
+        
         // Update dynamic energy sources if needed
         if let Some(ref mut config) = energy_config {
             if config.is_dynamic() && config.update_sources(epoch) {
@@ -1291,6 +1541,18 @@ fn run_cuda_simulation(
 
         if next_epoch_needs_save && !cuda_sim.has_pending_readback() {
             cuda_sim.begin_async_readback();
+        }
+        
+        // Collect metrics if enabled
+        if let Some(ref mut tracker) = metrics_tracker {
+            if tracker.should_collect(epoch) {
+                let all_soup = cuda_sim.get_all_soup();
+                let m = tracker.collect(epoch, &all_soup);
+                // Print brief status
+                print!("\r[Metrics] Epoch {:>8} | Compression: {:.2}x | Commands: {:.1}% | Zeros: {:.1}%    ",
+                    epoch, m.compression_ratio, m.command_fraction * 100.0, m.zero_byte_fraction * 100.0);
+                std::io::stdout().flush().ok();
+            }
         }
         
         // Save checkpoint
@@ -1430,9 +1692,14 @@ fn run_cuda_simulation(
     }
 
     // Shutdown async writer (wait for pending saves)
-    if let Some(writer) = async_writer {
+    if let Some(mut writer) = async_writer {
         println!("Waiting for async saves to complete...");
         writer.shutdown();
+    }
+    
+    // Print metrics summary if enabled
+    if let Some(tracker) = metrics_tracker {
+        tracker.print_summary();
     }
     
     println!("\n\nCUDA simulation complete!");
@@ -1465,6 +1732,7 @@ fn run_multi_gpu_simulation(
     save_raw: bool,
     raw_dir: &str,
     async_save: bool,
+    metrics_config: metrics::MetricsConfig,
 ) {
     use std::time::Instant;
     
@@ -1576,6 +1844,25 @@ fn run_multi_gpu_simulation(
         None
     };
     
+    // Create metrics tracker if enabled
+    let mut metrics_tracker = if metrics_config.enabled {
+        match metrics::MetricsTracker::new(metrics_config.clone()) {
+            Ok(tracker) => {
+                println!("Metrics tracking: ENABLED (interval: {} epochs)", metrics_config.interval);
+                if !metrics_config.output_path.as_ref().map_or(true, |p| p.is_empty()) {
+                    println!("  Output file: {}", metrics_config.output_path.as_ref().unwrap());
+                }
+                Some(tracker)
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not create metrics tracker: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    
     let mut total_ops = 0u64;
     let start_time = Instant::now();
     let mut last_report = Instant::now();
@@ -1585,6 +1872,20 @@ fn run_multi_gpu_simulation(
     const BAR_WIDTH: usize = 30;
     
     for epoch in start_epoch..max_epochs {
+        // Regenerate pairs for this epoch (dynamic pairing for more variety)
+        if effective_border_interaction {
+            let pairs = generate_mega_pairs_seeded(
+                num_programs, grid_width, grid_height, neighbor_range,
+                num_sims, layout_cols, layout_rows, seed, epoch
+            );
+            multi_sim.set_pairs_mega(&pairs);
+        } else {
+            let pairs = generate_2d_pairs_seeded(
+                num_programs, grid_width, grid_height, neighbor_range, seed, epoch
+            );
+            multi_sim.set_pairs_all(&pairs);
+        }
+        
         // Update dynamic energy sources if enabled
         if let Some(ref mut config) = energy_config {
             if config.is_dynamic() && config.update_sources(epoch) {
@@ -1608,6 +1909,18 @@ fn run_multi_gpu_simulation(
         // Start async readback for next epoch's save (copy happens while we do CPU work)
         if next_epoch_needs_save && !multi_sim.has_pending_readback() {
             multi_sim.begin_async_readback();
+        }
+        
+        // Collect metrics if enabled
+        if let Some(ref mut tracker) = metrics_tracker {
+            if tracker.should_collect(epoch) {
+                let all_soup = multi_sim.get_all_soup();
+                let m = tracker.collect(epoch, &all_soup);
+                // Print brief status
+                print!("\r[Metrics] Epoch {:>8} | Compression: {:.2}x | Commands: {:.1}% | Zeros: {:.1}%    ",
+                    epoch, m.compression_ratio, m.command_fraction * 100.0, m.zero_byte_fraction * 100.0);
+                std::io::stdout().flush().ok();
+            }
         }
         
         // Save checkpoint
@@ -1809,9 +2122,14 @@ fn run_multi_gpu_simulation(
     }
     
     // Shutdown async writer (wait for pending saves)
-    if let Some(writer) = async_writer {
+    if let Some(mut writer) = async_writer {
         println!("Waiting for async saves to complete...");
         writer.shutdown();
+    }
+    
+    // Print metrics summary if enabled
+    if let Some(tracker) = metrics_tracker {
+        tracker.print_summary();
     }
     
     let elapsed = start_time.elapsed().as_secs_f64();
@@ -1845,16 +2163,13 @@ fn run_gpu_simulation(
     frame_interval: usize,
     neighbor_range: usize,
     auto_terminate_dead_epochs: usize,
+    seed: u64,
 ) -> bool {
     // Returns true if completed normally, false if terminated early (all dead)
     use std::time::Instant;
     
     // Initialize with random data
     gpu_sim.init_random();
-    
-    // Generate pair indices for 2D grid topology
-    let pairs = generate_2d_pairs(num_programs, grid_width, grid_height, neighbor_range);
-    gpu_sim.set_pairs(&pairs);
     
     println!("Running {} epochs...\n", max_epochs);
     
@@ -1867,6 +2182,12 @@ fn run_gpu_simulation(
     let check_interval = if auto_terminate_dead_epochs > 0 { 100 } else { usize::MAX };
     
     for epoch in 0..max_epochs {
+        // Regenerate pairs for this epoch (dynamic pairing for more variety)
+        let pairs = generate_2d_pairs_seeded(
+            num_programs, grid_width, grid_height, neighbor_range, seed, epoch
+        );
+        gpu_sim.set_pairs(&pairs);
+        
         // Update dynamic energy sources if enabled
         if let Some(ref mut config) = energy_config {
             if config.is_dynamic() && config.update_sources(epoch) {
@@ -1937,7 +2258,7 @@ fn run_gpu_simulation(
     completed_normally
 }
 
-/// Generate pairs for 2D grid topology
+/// Generate pairs for 2D grid topology (non-seeded version for backwards compatibility)
 #[allow(dead_code)]
 fn generate_2d_pairs(
     num_programs: usize,
@@ -1945,12 +2266,44 @@ fn generate_2d_pairs(
     height: usize,
     neighbor_range: usize,
 ) -> Vec<(u32, u32)> {
-    use rand::Rng;
-    let mut rng = rand::rng();
+    generate_2d_pairs_seeded(num_programs, width, height, neighbor_range, 0, 0)
+}
+
+/// Generate pairs for 2D grid topology with deterministic seeding
+/// 
+/// Each epoch gets different pairings based on (base_seed, epoch).
+/// The algorithm:
+/// 1. Shuffle the order in which programs are processed (seeded by epoch)
+/// 2. For each program, pick a random available neighbor (seeded)
+/// 3. This ensures different pairings each epoch while being reproducible
+#[allow(dead_code)]
+fn generate_2d_pairs_seeded(
+    num_programs: usize,
+    width: usize,
+    height: usize,
+    neighbor_range: usize,
+    base_seed: u64,
+    epoch: usize,
+) -> Vec<(u32, u32)> {
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+    
+    // Create seeded RNG for reproducibility
+    let seed = base_seed.wrapping_add(epoch as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut rng = StdRng::seed_from_u64(seed);
+    
     let mut pairs = Vec::with_capacity(num_programs / 2);
     let mut available = vec![true; num_programs];
     
-    for i in 0..num_programs {
+    // Shuffle the order in which we process programs
+    // This is key to getting different pairings each epoch
+    let mut order: Vec<usize> = (0..num_programs).collect();
+    for i in (1..order.len()).rev() {
+        let j = rng.random_range(0..=i);
+        order.swap(i, j);
+    }
+    
+    for &i in &order {
         if !available[i] {
             continue;
         }
@@ -1985,10 +2338,9 @@ fn generate_2d_pairs(
     pairs
 }
 
-/// Generate all pairs for mega-simulation mode with absolute indices.
-/// Includes both internal pairs (within each sim) and cross-border pairs (between adjacent sims).
-/// Cross-border pairs are generated FIRST to ensure edge programs interact with neighbors.
+/// Generate all pairs for mega-simulation mode with absolute indices (non-seeded, for backwards compatibility).
 #[cfg(any(feature = "wgpu-compute", feature = "cuda"))]
+#[allow(dead_code)]
 fn generate_mega_pairs(
     num_programs: usize,
     grid_width: usize,
@@ -1998,16 +2350,45 @@ fn generate_mega_pairs(
     layout_cols: usize,
     layout_rows: usize,
 ) -> Vec<(u32, u32)> {
-    use rand::Rng;
-    let mut rng = rand::rng();
+    generate_mega_pairs_seeded(
+        num_programs, grid_width, grid_height, neighbor_range,
+        num_sims, layout_cols, layout_rows, 0, 0
+    )
+}
+
+/// Generate all pairs for mega-simulation mode with absolute indices and deterministic seeding.
+/// Includes both internal pairs (within each sim) and cross-border pairs (between adjacent sims).
+/// 
+/// Each epoch gets different pairings based on (base_seed, epoch).
+/// Cross-border pairs are randomized to ensure different edge programs interact each epoch.
+#[cfg(any(feature = "wgpu-compute", feature = "cuda"))]
+fn generate_mega_pairs_seeded(
+    num_programs: usize,
+    grid_width: usize,
+    grid_height: usize,
+    neighbor_range: usize,
+    num_sims: usize,
+    layout_cols: usize,
+    layout_rows: usize,
+    base_seed: u64,
+    epoch: usize,
+) -> Vec<(u32, u32)> {
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+    
+    // Create seeded RNG for reproducibility
+    let seed = base_seed.wrapping_add(epoch as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut rng = StdRng::seed_from_u64(seed);
+    
     let mut all_pairs = Vec::new();
     
     // Track which programs are already paired (globally)
     let total_programs = num_programs * num_sims;
     let mut available = vec![true; total_programs];
     
-    // FIRST: Generate cross-border pairs between adjacent simulations
-    // This ensures edge programs get a chance to interact across simulation boundaries
+    // Collect all potential cross-border edges, then shuffle them
+    let mut cross_border_candidates: Vec<(usize, usize)> = Vec::new();
+    
     for sim_row in 0..layout_rows {
         for sim_col in 0..layout_cols {
             let sim_idx = sim_row * layout_cols + sim_col;
@@ -2018,22 +2399,13 @@ fn generate_mega_pairs(
                 let neighbor_sim = sim_row * layout_cols + (sim_col + 1);
                 let neighbor_offset = neighbor_sim * num_programs;
                 
-                // Pair right edge with left edge
+                // Collect all right-left edge pairs
                 for y in 0..grid_height {
-                    // Right edge of current sim
                     let local_p1 = y * grid_width + (grid_width - 1);
                     let global_p1 = sim_offset + local_p1;
-                    
-                    // Left edge of neighbor sim
                     let local_p2 = y * grid_width + 0;
                     let global_p2 = neighbor_offset + local_p2;
-                    
-                    // Pair these edge programs
-                    if available[global_p1] && available[global_p2] {
-                        all_pairs.push((global_p1 as u32, global_p2 as u32));
-                        available[global_p1] = false;
-                        available[global_p2] = false;
-                    }
+                    cross_border_candidates.push((global_p1, global_p2));
                 }
             }
             
@@ -2042,33 +2414,45 @@ fn generate_mega_pairs(
                 let neighbor_sim = (sim_row + 1) * layout_cols + sim_col;
                 let neighbor_offset = neighbor_sim * num_programs;
                 
-                // Pair bottom edge with top edge
+                // Collect all bottom-top edge pairs
                 for x in 0..grid_width {
-                    // Bottom edge of current sim
                     let local_p1 = (grid_height - 1) * grid_width + x;
                     let global_p1 = sim_offset + local_p1;
-                    
-                    // Top edge of neighbor sim
                     let local_p2 = 0 * grid_width + x;
                     let global_p2 = neighbor_offset + local_p2;
-                    
-                    if available[global_p1] && available[global_p2] {
-                        all_pairs.push((global_p1 as u32, global_p2 as u32));
-                        available[global_p1] = false;
-                        available[global_p2] = false;
-                    }
+                    cross_border_candidates.push((global_p1, global_p2));
                 }
             }
         }
     }
     
-    let cross_border_count = all_pairs.len();
+    // Shuffle cross-border candidates so different edges get paired each epoch
+    for i in (1..cross_border_candidates.len()).rev() {
+        let j = rng.random_range(0..=i);
+        cross_border_candidates.swap(i, j);
+    }
     
-    // SECOND: Generate internal pairs for each simulation (remaining programs)
+    // FIRST: Process shuffled cross-border pairs
+    for (global_p1, global_p2) in cross_border_candidates {
+        if available[global_p1] && available[global_p2] {
+            all_pairs.push((global_p1 as u32, global_p2 as u32));
+            available[global_p1] = false;
+            available[global_p2] = false;
+        }
+    }
+    
+    // SECOND: Generate internal pairs for each simulation with shuffled order
     for sim_idx in 0..num_sims {
         let sim_offset = sim_idx * num_programs;
         
-        for local_i in 0..num_programs {
+        // Shuffle the order in which we process programs within this sim
+        let mut order: Vec<usize> = (0..num_programs).collect();
+        for i in (1..order.len()).rev() {
+            let j = rng.random_range(0..=i);
+            order.swap(i, j);
+        }
+        
+        for &local_i in &order {
             let global_i = sim_offset + local_i;
             if !available[global_i] {
                 continue;
@@ -2078,15 +2462,20 @@ fn generate_mega_pairs(
             let y = local_i / grid_width;
             
             // Find available neighbors within this simulation
+            // NOTE: No toroidal wrapping in mega mode - edge cells connect via cross-border pairs only
             let mut neighbors = Vec::new();
             for dx in -(neighbor_range as i32)..=(neighbor_range as i32) {
                 for dy in -(neighbor_range as i32)..=(neighbor_range as i32) {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    let nx = (x as i32 + dx).rem_euclid(grid_width as i32) as usize;
-                    let ny = (y as i32 + dy).rem_euclid(grid_height as i32) as usize;
-                    let local_neighbor = ny * grid_width + nx;
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    // Skip if outside simulation bounds (no toroidal wrap)
+                    if nx < 0 || nx >= grid_width as i32 || ny < 0 || ny >= grid_height as i32 {
+                        continue;
+                    }
+                    let local_neighbor = (ny as usize) * grid_width + (nx as usize);
                     let global_neighbor = sim_offset + local_neighbor;
                     if available[global_neighbor] {
                         neighbors.push(global_neighbor);
@@ -2102,9 +2491,6 @@ fn generate_mega_pairs(
             }
         }
     }
-    
-    // Log cross-border stats for debugging
-    eprintln!("  Cross-border pairs generated first: {}", cross_border_count);
     
     all_pairs
 }
@@ -2724,10 +3110,39 @@ impl AsyncWriter {
     }
     
     /// Wait for all pending saves to complete and shutdown
-    fn shutdown(mut self) {
+    fn shutdown(&mut self) {
         let _ = self.sender.send(SaveMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if let Err(e) = handle.join() {
+                eprintln!("Warning: AsyncWriter thread panicked: {:?}", e);
+            }
+        }
+    }
+    
+    /// Get the number of pending saves in the queue (approximate)
+    /// Note: mpsc doesn't expose queue length, so this just checks if sender is connected
+    fn is_connected(&self) -> bool {
+        // Try sending a dummy check - if it fails, the receiver is gone
+        // Actually, we can't do this without consuming a message, so just return true
+        // if the handle exists
+        self.handle.is_some()
+    }
+}
+
+/// Ensure AsyncWriter flushes pending saves when dropped
+impl Drop for AsyncWriter {
+    fn drop(&mut self) {
+        // Send shutdown signal and wait for thread to complete
+        // This ensures all queued saves are processed before program exit
+        if self.handle.is_some() {
+            let _ = self.sender.send(SaveMessage::Shutdown);
+            if let Some(handle) = self.handle.take() {
+                // Give the thread a chance to complete, but don't block forever
+                // In practice, join() will complete once all queued items are processed
+                if let Err(e) = handle.join() {
+                    eprintln!("Warning: AsyncWriter thread panicked during drop: {:?}", e);
+                }
+            }
         }
     }
 }

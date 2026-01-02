@@ -482,6 +482,24 @@ impl EnergyConfig {
         }
         
         let r = self.default_radius;
+        
+        // Validate that grid is large enough for the radius
+        // Need at least 2*radius + 1 for valid placement range
+        if self.grid_width <= 2 * r || self.grid_height <= 2 * r {
+            // Grid too small for this radius - place at center instead
+            let x = self.grid_width / 2;
+            let y = self.grid_height / 2;
+            
+            let shape = if self.default_shape.to_lowercase() == "random" {
+                EnergyShape::random(&mut self.rng)
+            } else {
+                EnergyShape::from_str(&self.default_shape)
+            };
+            
+            self.sources.push(EnergySource::with_shape(x, y, r, shape));
+            return true;
+        }
+        
         // Keep sources away from edges by radius
         let x = self.rng.random_range(r..self.grid_width.saturating_sub(r));
         let y = self.rng.random_range(r..self.grid_height.saturating_sub(r));

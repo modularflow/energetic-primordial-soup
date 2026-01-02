@@ -2,7 +2,8 @@
 /target
 
 # Output directories
-/frames
+/frames*
+/raw_data*
 frames_1766911219
 /runs
 /checkpoints
@@ -11,7 +12,7 @@ frames_1766911219
 *.mp4
 *.ppm
 generated.yaml
-
+metrics.csv
 # Editor/IDE
 .vscode/
 .idea/

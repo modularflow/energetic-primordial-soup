@@ -149,14 +149,14 @@ const BFF_CUDA_KERNEL: &str = r#"
 extern "C" __global__ void bff_batched_evaluate(
     unsigned char* soup,              // All programs across all sims: [sim0_prog0, sim0_prog1, ..., sim1_prog0, ...]
     const unsigned int* pair_indices, // Pairs per sim: [p1, p2, p1, p2, ...]
-    unsigned int* energy_state,       // Packed energy state per program: reserve(8) | timer(8) | dead(8) | unused(8)
+    unsigned int* energy_state,       // Packed energy state per program: reserve(16) | timer(15) | dead(1)
     const unsigned int* sim_configs,  // Per-sim configs: [death_timer, reserve_duration] pairs
     const unsigned int* energy_map,   // Bitmask: 1 bit per program indicating if in energy zone
     unsigned long long* ops_count,    // Atomic counter for total ops
     // Packed parameters (to fit cudarc's 12-param limit)
     unsigned long long params_packed1, // num_pairs(hi) | num_programs(lo)
     unsigned long long params_packed2, // num_sims(hi) | steps_per_run(lo)
-    unsigned long long params_packed3, // mutation_prob(hi) | flags(lo: bit0=energy_enabled, bit1=mega_mode)
+    unsigned long long params_packed3, // mutation_prob(hi) | flags(lo: bit0=energy_enabled, bit1=mega_mode, bits2-31=spontaneous_rate)
     unsigned long long seed,
     unsigned long long epoch
 ) {
@@ -173,6 +173,7 @@ extern "C" __global__ void bff_batched_evaluate(
     unsigned int flags = (unsigned int)(params_packed3 & 0xFFFFFFFF);
     unsigned int energy_enabled = flags & 1u;
     unsigned int mega_mode = (flags >> 1) & 1u;
+    unsigned int spontaneous_rate = flags >> 2;  // Upper 30 bits for spontaneous_rate
     const int SINGLE_TAPE_SIZE = 64;
     const int FULL_TAPE_SIZE = 128;
 
@@ -240,12 +241,13 @@ extern "C" __global__ void bff_batched_evaluate(
             return (energy_map[word_idx] & (1u << bit_idx)) != 0;
         };
 
-        // Energy state helpers - packed as: reserve(8 bits) | timer(8 bits) | dead(8 bits)
-        auto get_reserve = [](unsigned int state) -> unsigned int { return state & 0xFF; };
-        auto get_timer = [](unsigned int state) -> unsigned int { return (state >> 8) & 0xFF; };
-        auto is_dead = [](unsigned int state) -> bool { return ((state >> 16) & 0xFF) != 0; };
+        // Energy state helpers - packed as: reserve(16 bits) | timer(15 bits) | dead(1 bit)
+        // This allows death_epochs up to 32767 (vs 255 with 8-bit packing)
+        auto get_reserve = [](unsigned int state) -> unsigned int { return state & 0xFFFF; };
+        auto get_timer = [](unsigned int state) -> unsigned int { return (state >> 16) & 0x7FFF; };
+        auto is_dead = [](unsigned int state) -> bool { return (state >> 31) != 0; };
         auto pack_state = [](unsigned int reserve, unsigned int timer, bool dead) -> unsigned int {
-            return (reserve & 0xFF) | ((timer & 0xFF) << 8) | ((dead ? 1u : 0u) << 16);
+            return (reserve & 0xFFFF) | ((timer & 0x7FFF) << 16) | ((dead ? 1u : 0u) << 31);
         };
 
         // Load energy states
@@ -466,12 +468,52 @@ extern "C" __global__ void bff_batched_evaluate(
                 energy_state[p2_abs] = pack_state(p2_reserve, p2_timer, p2_dead);
             }
 
-            // Write back soup
+            // Spontaneous generation: dead tapes in energy zones have a chance to spawn new random programs
+            bool p1_spawned = false;
+            bool p2_spawned = false;
+            
+            if (energy_enabled && spontaneous_rate > 0) {
+                // P1: Check for spontaneous generation
+                if (p1_stays_dead && p1_in_zone) {
+                    rng = lcg(rng);
+                    if (rng % spontaneous_rate == 0) {
+                        // Spawn new random program!
+                        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                            rng = lcg(rng);
+                            tape[i] = (unsigned char)((rng >> 8) & 0xFF);
+                        }
+                        // Revive the program with per-sim reserve duration
+                        unsigned int p1_reserve_dur = sim_configs[p1_sim * 2 + 1];
+                        energy_state[p1_abs] = pack_state(p1_reserve_dur, 0, false);
+                        p1_spawned = true;
+                        p1_stays_dead = false;
+                    }
+                }
+                
+                // P2: Check for spontaneous generation
+                if (p2_stays_dead && p2_in_zone) {
+                    rng = lcg(rng);
+                    if (rng % spontaneous_rate == 0) {
+                        // Spawn new random program!
+                        for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
+                            rng = lcg(rng);
+                            tape[SINGLE_TAPE_SIZE + i] = (unsigned char)((rng >> 8) & 0xFF);
+                        }
+                        // Revive the program with per-sim reserve duration
+                        unsigned int p2_reserve_dur = sim_configs[p2_sim * 2 + 1];
+                        energy_state[p2_abs] = pack_state(p2_reserve_dur, 0, false);
+                        p2_spawned = true;
+                        p2_stays_dead = false;
+                    }
+                }
+            }
+
+            // Write back soup (dead tapes stay zeroed unless spontaneously spawned)
             if (p1_stays_dead) {
                 for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
                     soup[p1_byte_offset + i] = 0;
                 }
-            } else if (energy_enabled && is_dead(energy_state[p1_abs])) {
+            } else if (energy_enabled && is_dead(energy_state[p1_abs]) && !p1_spawned) {
                 for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
                     soup[p1_byte_offset + i] = 0;
                 }
@@ -485,7 +527,7 @@ extern "C" __global__ void bff_batched_evaluate(
                 for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
                     soup[p2_byte_offset + i] = 0;
                 }
-            } else if (energy_enabled && is_dead(energy_state[p2_abs])) {
+            } else if (energy_enabled && is_dead(energy_state[p2_abs]) && !p2_spawned) {
                 for (int i = 0; i < SINGLE_TAPE_SIZE; i++) {
                     soup[p2_byte_offset + i] = 0;
                 }
@@ -544,6 +586,7 @@ pub struct CudaMultiSimulation {
     epoch: u64,
     energy_enabled: bool,
     mega_mode: bool,
+    spontaneous_rate: u32,
     pending_readback: Option<Vec<u8>>,
 }
 
@@ -594,6 +637,7 @@ impl CudaMultiSimulation {
             .unwrap_or(false);
         let default_death = energy_config.map(|c| c.interaction_death).unwrap_or(10);
         let default_reserve = energy_config.map(|c| c.reserve_duration).unwrap_or(5);
+        let spontaneous_rate = energy_config.map(|c| c.spontaneous_rate).unwrap_or(0);
         
         // Pairs (same for all sims - local indices)
         let pairs: Vec<u32> = generate_pairs(num_programs)
@@ -670,6 +714,7 @@ impl CudaMultiSimulation {
             epoch: 0,
             energy_enabled,
             mega_mode: false,
+            spontaneous_rate,
             pending_readback: None,
         })
     }
@@ -690,8 +735,10 @@ impl CudaMultiSimulation {
         // Pack some u32 params together into u64 values for the kernel
         let params_packed1 = ((self.num_pairs as u64) << 32) | (self.num_programs as u64);
         let params_packed2 = ((self.num_sims as u64) << 32) | (self.steps_per_run as u64);
+        // Pack flags: bit0=energy_enabled, bit1=mega_mode, bits2-31=spontaneous_rate
         let flags = (if self.energy_enabled { 1u64 } else { 0u64 })
-            | (if self.mega_mode { 2u64 } else { 0u64 });
+            | (if self.mega_mode { 2u64 } else { 0u64 })
+            | ((self.spontaneous_rate as u64) << 2);
         let params_packed3 = ((self.mutation_prob as u64) << 32) | flags;
 
         let cfg = LaunchConfig {
