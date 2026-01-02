@@ -223,29 +223,6 @@ Available shapes for energy zones:
 - `ellipse_v` - Vertical ellipse
 - `random` - Random shape per source
 
-### Simulation Groups
-
-When running parallel simulations, you can assign different `death_epochs` values to groups of simulations. This enables comparative experiments within a single run:
-
-```yaml
-energy:
-  enabled: true
-  death_epochs: 10000           # Default for sims not in a group
-  
-  # Define groups with different evolutionary pressures
-  sim_groups:
-    - death_epochs: 10000       # Fast death - high pressure
-      count: 85                 # Number of sims in this group
-    - death_epochs: 100000      # Slow death - moderate pressure
-      count: 85
-    - death_epochs: 0           # Immortal - no death pressure
-      count: 86
-```
-
-- If `count` is omitted from a group, remaining simulations are split evenly among groups without explicit counts
-- If `sim_groups` is empty or omitted, all simulations use the global `death_epochs` value
-- A `sim_groups.txt` file is saved to the frames directory documenting which simulations belong to which group
-
 ## Mega-Simulation Mode
 
 When `border_interaction` is enabled, parallel simulations are arranged in a grid where adjacent simulations can interact at their borders:
@@ -324,55 +301,6 @@ The simulation generates:
 
 When running mega-simulations, a combined frame shows all simulations arranged in their grid layout.
 
-## CLI Options
-
-```
-USAGE:
-    energetic-primordial-soup [OPTIONS]
-    energetic-primordial-soup --config config.yaml
-    energetic-primordial-soup --generate-config [output.yaml]
-    energetic-primordial-soup --render-raw <raw_data_dir>
-
-CONFIG FILE:
-    -c, --config <FILE>       Load settings from YAML config file
-    --generate-config [FILE]  Generate template config (default: config.yaml)
-
-OPTIONS:
-    -w, --grid-width <N>      Grid width (default: 512)
-    -h, --grid-height <N>     Grid height (default: 256)
-    -s, --seed <N>            Random seed (default: 42)
-    -m, --mutation-prob <N>   Mutation probability (default: 262144)
-    --steps-per-run <N>       Steps per BFF run (default: 8192)
-    -e, --max-epochs <N>      Maximum epochs (default: 10000)
-    -n, --neighbor-range <N>  Neighbor range (default: 2)
-    -f, --frame-interval <N>  Save frame every N epochs (0 = disabled)
-    -d, --frames-dir <PATH>   Frames output directory
-
-ENERGY SYSTEM:
-    --energy                  Enable energy sources
-    --energy-sources <N>      Initial sources 1-8 (default: 4)
-    --energy-radius <N>       Radius of each source (default: 64)
-    --energy-reserve <N>      Reserve epochs when leaving zone (default: 5)
-    --energy-death <N>        Epochs until program death (default: 10)
-
-DYNAMIC ENERGY:
-    --energy-random           Randomize source positions
-    --energy-max-sources <N>  Max simultaneous sources (default: 8)
-    --energy-source-lifetime <N>  Epochs until source expires (0=infinite)
-    --energy-spawn-rate <N>   Spawn new source every N epochs (0=disabled)
-
-RAW DATA / ASYNC SAVE:
-    --save-raw                Save raw soup data
-    --raw-dir <PATH>          Raw data output directory
-    --async-save              Non-blocking saves (default)
-    --no-async-save           Blocking saves
-    --render-frames           Render frames during simulation
-    --no-render-frames        Skip rendering
-
-POST-PROCESSING:
-    --render-raw <PATH>       Render frames from raw data directory
-```
-
 ## BFF Instruction Set
 
 | Instruction | Description |
@@ -385,20 +313,6 @@ POST-PROCESSING:
 | `[` `]` | Loop (jump if byte at head 0 is zero/non-zero) |
 
 Programs are paired and execute on a combined 128-byte tape (64 bytes from each program).
-
-## Performance
-
-On an NVIDIA RTX 4090:
-
-| Configuration | Throughput | Epochs/sec |
-|--------------|------------|------------|
-| Single simulation (1024x512) | ~166B ops/s | ~40 |
-| 8 parallel simulations (1024x512 each) | ~198B ops/s | ~6 |
-| 256 mega-simulation (16x16 of 256x256) | ~280B ops/s | ~4 |
-
-Note: Ops/sec measures total computation across all simulations. Larger configurations process more data per epoch, so epochs/sec decreases while total throughput increases.
-
-Raw data saving with async mode has minimal performance impact as saves occur in a background thread.
 
 ## License
 
