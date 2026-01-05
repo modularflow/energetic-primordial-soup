@@ -3,7 +3,7 @@
 
 # Output directories
 /frames*
-/raw_data*
+/raw_*
 frames_1766911219
 /runs
 /checkpoints

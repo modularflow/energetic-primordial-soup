@@ -314,6 +314,7 @@ struct EnergyParams {
     reserve_duration: u32,
     death_timer: u32,
     spontaneous_rate: u32,  // 1 in N chance for dead tape in zone to spawn (0 = disabled)
+    border_thickness: u32,
     // Up to 8 sources: x, y, shape, radius
     src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
     src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
@@ -390,6 +391,16 @@ fn in_energy_zone(prog_idx: u32) -> bool {
     
     let x = i32(prog_idx % params.grid_width);
     let y = i32(prog_idx / params.grid_width);
+
+    // Check if we are in the "dead zone" border
+    let bt = i32(energy_params.border_thickness);
+    if (bt > 0) {
+        if (x < bt || x >= i32(params.grid_width) - bt ||
+            y < bt || y >= i32(params.grid_height) - bt) {
+            return false; // In dead zone - no energy
+        }
+    }
+
     let n = energy_params.num_sources;
     
     // Check each source with its shape
@@ -814,6 +825,7 @@ struct EnergyParams {
     reserve_duration: u32,
     death_timer: u32,
     spontaneous_rate: u32,
+    border_thickness: u32,
     src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
     src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
     src2_x: u32, src2_y: u32, src2_shape: u32, src2_radius: u32,
@@ -896,6 +908,19 @@ fn apply_mutations_sparse(
 // Returns true if program is in an energy zone
 fn in_energy_zone_fast(global_prog_idx: u32) -> bool {
     if (energy_params.enabled == 0u) { return true; }
+    
+    // Check if we are in the "dead zone" border
+    let local_prog_idx = global_prog_idx % (params.grid_width * params.grid_height);
+    let x = i32(local_prog_idx % params.grid_width);
+    let y = i32(local_prog_idx / params.grid_width);
+    let bt = i32(energy_params.border_thickness);
+    if (bt > 0) {
+        if (x < bt || x >= i32(params.grid_width) - bt ||
+            y < bt || y >= i32(params.grid_height) - bt) {
+            return false; // In dead zone - no energy
+        }
+    }
+
     // Each u32 holds 32 program flags
     let word_idx = global_prog_idx / 32u;
     let bit_idx = global_prog_idx % 32u;
@@ -1557,6 +1582,7 @@ fn main(
                 reserve_duration: config.reserve_duration as u32,
                 death_timer: config.interaction_death as u32,
                 spontaneous_rate: config.spontaneous_rate,
+                border_thickness: 0, // Not used in this legacy struct
                 src0_x, src0_y, src0_shape, src0_radius,
                 src1_x, src1_y, src1_shape, src1_radius,
                 src2_x, src2_y, src2_shape, src2_radius,
@@ -2553,6 +2579,39 @@ fn main(
             self.device.poll(wgpu::Maintain::Wait);
         }
 
+        /// Update energy config
+        pub fn update_energy_config_all(&mut self, config: &crate::energy::EnergyConfig) {
+            let energy_params = EnergyParams {
+                enabled: if config.enabled { 1 } else { 0 },
+                num_sources: config.sources.len().min(8) as u32,
+                radius: config.default_radius as u32,
+                reserve_duration: config.reserve_duration as u32,
+                death_timer: config.interaction_death as u32,
+                spontaneous_rate: config.spontaneous_rate,
+                border_thickness: config.border_thickness as u32,
+                src0_x: 0, src0_y: 0, src0_shape: 0, src0_radius: 0,
+                src1_x: 0, src1_y: 0, src1_shape: 0, src1_radius: 0,
+                src2_x: 0, src2_y: 0, src2_shape: 0, src2_radius: 0,
+                src3_x: 0, src3_y: 0, src3_shape: 0, src3_radius: 0,
+                src4_x: 0, src4_y: 0, src4_shape: 0, src4_radius: 0,
+                src5_x: 0, src5_y: 0, src5_shape: 0, src5_radius: 0,
+                src6_x: 0, src6_y: 0, src6_shape: 0, src6_radius: 0,
+                src7_x: 0, src7_y: 0, src7_shape: 0, src7_radius: 0,
+            };
+            self.energy_params = energy_params;
+            self.queue.write_buffer(&self.energy_params_buffer, 0, bytemuck::bytes_of(&self.energy_params));
+            
+            // Recompute bitmask if sources changed
+            let map = Self::compute_energy_map_static(
+                &self.energy_params,
+                self.num_programs,
+                self.num_sims,
+                self.grid_width,
+                self.grid_height,
+            );
+            self.queue.write_buffer(&self.energy_map_buffer, 0, bytemuck::cast_slice(&map));
+        }
+
         /// Compute energy zone bitmask on CPU
         /// Returns packed u32s where bit i indicates if program i is in an energy zone
         fn compute_energy_map_static(
@@ -2590,6 +2649,16 @@ fn main(
                     let x = (prog_idx % grid_width) as i32;
                     let y = (prog_idx / grid_width) as i32;
                     
+                    // Check if we are in the "dead zone" border
+                    let bt = energy_params.border_thickness as i32;
+                    if bt > 0 {
+                        if x < bt || x >= grid_width as i32 - bt ||
+                           y < bt || y >= grid_height as i32 - bt {
+                            // In dead zone - no energy
+                            continue;
+                        }
+                    }
+
                     let mut in_zone = false;
                     for src_idx in 0..energy_params.num_sources as usize {
                         let (base_x, base_y, shape, radius) = sources[src_idx];

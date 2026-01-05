@@ -212,6 +212,8 @@ pub struct EnergyConfig {
     pub spontaneous_rate: u32,
     /// Dynamic source options
     pub dynamic: DynamicEnergyConfig,
+    /// Thickness of "dead zone" border (for mega-sim simulations)
+    pub border_thickness: usize,
     /// Grid dimensions (for random placement)
     pub grid_width: usize,
     pub grid_height: usize,
@@ -230,6 +232,7 @@ impl Default for EnergyConfig {
             default_shape: "circle".to_string(),
             spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
+            border_thickness: 0,
             grid_width: 512,
             grid_height: 256,
             rng: StdRng::seed_from_u64(42),
@@ -358,6 +361,7 @@ impl EnergyConfig {
             default_shape: "circle".to_string(),
             spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
+            border_thickness: 0,
             grid_width: width,
             grid_height: height,
             rng: StdRng::seed_from_u64(42),
@@ -377,11 +381,12 @@ impl EnergyConfig {
         source_lifetime: usize,
         spawn_rate: usize,
         seed: u64,
+        border_thickness: usize,
     ) -> Self {
         Self::full_with_options(
             width, height, radius, count, reserve_duration, interaction_death,
             random_placement, max_sources, source_lifetime, spawn_rate, seed,
-            0, "circle".to_string(),
+            0, "circle".to_string(), border_thickness,
         )
     }
     
@@ -400,6 +405,7 @@ impl EnergyConfig {
         seed: u64,
         spontaneous_rate: u32,
         shape: String,
+        border_thickness: usize,
     ) -> Self {
         let use_random_shape = shape.to_lowercase() == "random";
         let mut rng = StdRng::seed_from_u64(seed);
@@ -420,6 +426,7 @@ impl EnergyConfig {
                     source_lifetime,
                     spawn_rate,
                 },
+                border_thickness,
                 grid_width: width,
                 grid_height: height,
                 rng,
@@ -439,10 +446,22 @@ impl EnergyConfig {
                 source_lifetime,
                 spawn_rate,
             };
+            c.border_thickness = border_thickness;
             c.rng = rng;
             c
         };
         
+        // Ensure fixed sources don't start inside the border dead zone.
+        // (Border cells are never energized anyway, but keeping sources out avoids confusing layouts.)
+        if border_thickness > 0 && !config.sources.is_empty() {
+            let max_x = width.saturating_sub(border_thickness).saturating_sub(1);
+            let max_y = height.saturating_sub(border_thickness).saturating_sub(1);
+            for src in &mut config.sources {
+                src.x = src.x.clamp(border_thickness, max_x);
+                src.y = src.y.clamp(border_thickness, max_y);
+            }
+        }
+
         // If random placement, spawn initial sources
         if random_placement {
             for _ in 0..count.min(max_sources) {
@@ -469,6 +488,7 @@ impl EnergyConfig {
             default_shape: "circle".to_string(),
             spontaneous_rate: 0,
             dynamic: DynamicEnergyConfig::default(),
+            border_thickness: 0,
             grid_width: 512,
             grid_height: 256,
             rng: StdRng::seed_from_u64(42),
@@ -482,6 +502,7 @@ impl EnergyConfig {
         }
         
         let r = self.default_radius;
+        let bt = self.border_thickness;
         
         // Validate that grid is large enough for the radius
         // Need at least 2*radius + 1 for valid placement range
@@ -500,9 +521,28 @@ impl EnergyConfig {
             return true;
         }
         
-        // Keep sources away from edges by radius
-        let x = self.rng.random_range(r..self.grid_width.saturating_sub(r));
-        let y = self.rng.random_range(r..self.grid_height.saturating_sub(r));
+        // Keep sources away from edges by radius AND out of the border dead zone.
+        // Border cells are never energized, but we also prevent source centers from spawning there.
+        let min_x = r + bt;
+        let min_y = r + bt;
+        let max_x = self.grid_width.saturating_sub(r + bt);
+        let max_y = self.grid_height.saturating_sub(r + bt);
+
+        if min_x >= max_x || min_y >= max_y {
+            // No valid placement range given radius + border thickness; place at center.
+            let x = self.grid_width / 2;
+            let y = self.grid_height / 2;
+            let shape = if self.default_shape.to_lowercase() == "random" {
+                EnergyShape::random(&mut self.rng)
+            } else {
+                EnergyShape::from_str(&self.default_shape)
+            };
+            self.sources.push(EnergySource::with_shape(x, y, r, shape));
+            return true;
+        }
+
+        let x = self.rng.random_range(min_x..max_x);
+        let y = self.rng.random_range(min_y..max_y);
         
         // Determine shape - if "random", pick a random shape
         let shape = if self.default_shape.to_lowercase() == "random" {
@@ -564,6 +604,13 @@ impl EnergyConfig {
     pub fn in_energy_zone(&self, x: usize, y: usize) -> bool {
         if !self.enabled {
             return true; // If disabled, everywhere is "energized"
+        }
+        // Check if we are in the "dead zone" border
+        if self.border_thickness > 0 {
+            if x < self.border_thickness || x >= self.grid_width - self.border_thickness ||
+               y < self.border_thickness || y >= self.grid_height - self.border_thickness {
+                return false; // In dead zone - no energy
+            }
         }
         self.sources.iter().any(|src| src.contains(x, y))
     }

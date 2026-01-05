@@ -89,6 +89,7 @@ fn compute_energy_map(
     num_sims: usize,
     grid_width: usize,
     grid_height: usize,
+    border_thickness: usize,
 ) -> Vec<u32> {
     let total_programs = num_programs * num_sims;
     let num_words = (total_programs + 31) / 32;
@@ -115,6 +116,15 @@ fn compute_energy_map(
         for prog_idx in 0..num_programs {
             let x = (prog_idx % grid_width) as i32;
             let y = (prog_idx / grid_width) as i32;
+
+            // Check if we are in the "dead zone" border
+            if border_thickness > 0 {
+                if x < border_thickness as i32 || x >= (grid_width - border_thickness) as i32 ||
+                   y < border_thickness as i32 || y >= (grid_height - border_thickness) as i32 {
+                    // In dead zone - no energy
+                    continue;
+                }
+            }
 
             let mut in_zone = false;
             for (src_idx, (base_x, base_y, shape, radius)) in sources.iter().enumerate() {
@@ -587,6 +597,7 @@ pub struct CudaMultiSimulation {
     energy_enabled: bool,
     mega_mode: bool,
     spontaneous_rate: u32,
+    border_thickness: usize,
     pending_readback: Option<Vec<u8>>,
 }
 
@@ -605,6 +616,7 @@ impl CudaMultiSimulation {
         steps_per_run: u32,
         energy_config: Option<&crate::energy::EnergyConfig>,
         per_sim_configs: Option<Vec<(u32, u32)>>,
+        border_thickness: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize CUDA
         let device = CudaDevice::new(0)?;
@@ -662,13 +674,14 @@ impl CudaMultiSimulation {
             }
         };
         
-        // Energy map (precomputed zones, with per-sim offsets)
+        // Energy map (precomputed zones, with per-sim offsets and border thickness)
         let energy_map = compute_energy_map(
             energy_config,
             num_programs,
             num_sims,
             grid_width,
             grid_height,
+            border_thickness,
         );
         
         // Soup with random data
@@ -715,6 +728,7 @@ impl CudaMultiSimulation {
             energy_enabled,
             mega_mode: false,
             spontaneous_rate,
+            border_thickness,
             pending_readback: None,
         })
     }
@@ -942,6 +956,7 @@ impl CudaMultiSimulation {
             self.num_sims,
             self.grid_width,
             self.grid_height,
+            self.border_thickness,
         );
 
         // Upload new energy map to GPU

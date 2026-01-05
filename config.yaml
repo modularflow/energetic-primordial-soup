@@ -15,32 +15,34 @@ backend: "cuda"
 # Grid dimensions
 # The simulation runs on a 2D toroidal grid
 grid:
-  width: 128      # Grid width in programs
-  height: 127  # Grid height in programs
+  width: 64      # Grid width in programs
+  height: 64  # Grid height in programs
 
 # Core simulation parameters
 simulation:
   seed: 42                # Random seed for reproducibility
   mutation_rate: 2048     # 1 in N chance per byte (higher = less mutation)
   steps_per_run: 8192     # BFF execution steps per epoch
-  max_epochs: 16000     # Total epochs to run
+  max_epochs: 1000000     # Total epochs to run
   neighbor_range: 2       # Pairing range (2 = 5x5 neighborhood)
   auto_terminate_dead_epochs: 0   # Terminate if all dead for N epochs (0=disabled, has GPU overhead)
-  parallel_sims: 4        # Run N simulations in parallel on GPU (1=single)
-  parallel_layout: [2, 2]  # Arrange parallel sims as [cols, rows] grid (must multiply to parallel_sims)
+  parallel_sims: 32        # Run N simulations in parallel on GPU (1=single)
+  parallel_layout: [8, 4]  # Arrange parallel sims as [cols, rows] grid (must multiply to parallel_sims)
   border_interaction: true # Enable cross-simulation pairing at borders (mega-simulation mode)
+  border_thickness: 10      # Thickness of zero-energy "dead zone" between simulations
+  # migration_probability: 0.2 # Probability of cross-border interaction (deprecated in favor of physical dead zone)
 
 # Output settings
 # NOTE: If using run.sh, it overrides frames_dir by default. 
 #       Set USE_CONFIG_DIRS=true ./run.sh to use these paths instead.
 output:
-  frame_interval: 16      # Save frame every N epochs (0 = disabled)
+  frame_interval: 256      # Save frame every N epochs (0 = disabled)
   frames_dir: "frames"     # Output directory for frames (relative or absolute path)
   frame_format: "png"      # "png" (compressed, ~10x smaller) or "ppm" (uncompressed, fast)
   thumbnail_scale: 1       # Downscale factor for regular frames (1 = full size, 4 = 1/4 size)
   
   # Raw data saving (for post-simulation rendering)
-  save_raw: false       # Save raw soup data (fast binary, no rendering)
+  save_raw: true       # Save raw soup data (fast binary, no rendering)
   raw_dir: "raw_data"  # Directory for raw data files
   async_save: true         # Save in background thread (non-blocking)
   render_frames: true  # Also render frames during simulation (if false, only save raw)
@@ -56,11 +58,11 @@ checkpoint:
 # Controls which programs can mutate based on proximity to "energy sources"
 energy:
   enabled: true          # Set to true to enable energy system
-  sources: 1             # Initial number of sources (1-8)
+  sources: 4             # Initial number of sources (1-8)
                           # 4=corners, 5=+center, 6=+edges, 8=all
-  radius: 16              # Radius of each energy source
-  reserve_epochs: 100       # Energy reserve when leaving zone
-  death_epochs: 100       # Epochs without interaction until death (0 = infinite/never)
+  radius: 32              # Radius of each energy source
+  reserve_epochs: 10       # Energy reserve when leaving zone
+  death_epochs: 20       # Epochs without interaction until death (0 = infinite/never)
   spontaneous_rate: 1000     # 1 in N chance for dead tape in energy zone to spawn new random program (0 = disabled)
   shape: "random"         # Shape of energy zones: "circle", "strip_h", "strip_v", 
                           # "half_circle", "half_circle_bottom", "half_circle_left", "half_circle_right",
@@ -70,9 +72,9 @@ energy:
   # Make energy sources spawn, move, and expire over time
   dynamic:
     random_placement: true   # Randomize source positions
-    max_sources: 1            # Maximum simultaneous sources
-    source_lifetime: 1000       # Epochs until source expires (0 = infinite)
-    spawn_rate: 1000             # Spawn new source every N epochs (0 = disabled)
+    max_sources: 12            # Maximum simultaneous sources
+    source_lifetime: 5000       # Epochs until source expires (0 = infinite)
+    spawn_rate: 250             # Spawn new source every N epochs (0 = disabled)
 
   # Per-Simulation Groups (optional)
   # Run different death_epochs across simulations in a single run.

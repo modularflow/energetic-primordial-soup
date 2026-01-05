@@ -63,6 +63,10 @@ pub struct SimConfig {
     pub parallel_layout: [usize; 2],
     /// Enable border interaction between adjacent sub-simulations
     pub border_interaction: bool,
+    /// Probability of cross-border interaction (0.0 to 1.0)
+    pub migration_probability: f64,
+    /// Thickness of zero-energy "dead zone" between simulations
+    pub border_thickness: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +200,8 @@ impl Default for SimConfig {
             parallel_sims: 1,
             parallel_layout: [1, 1],  // Default: single sim or independent sims
             border_interaction: false, // Disabled by default
+            migration_probability: 0.2, // 20% chance to cross border if interaction possible
+            border_thickness: 2, // 2-pixel dead zone at borders
         }
     }
 }
@@ -408,10 +414,15 @@ impl Config {
             ));
         }
         
-        // Check mutation_rate
-        if self.simulation.mutation_rate == 0 {
-            warnings.push("mutation_rate is 0, will be treated as 1 (maximum mutation)".to_string());
-        }
+    // Check mutation_rate
+    if self.simulation.mutation_rate == 0 {
+        warnings.push("mutation_rate is 0, will be treated as 1 (maximum mutation)".to_string());
+    }
+
+    // Check border_thickness
+    if self.simulation.border_thickness >= self.grid.width / 2 || self.simulation.border_thickness >= self.grid.height / 2 {
+        return Err("border_thickness is too large for grid dimensions".to_string());
+    }
         
         // Check energy radius vs grid size
         if self.energy.enabled {
@@ -509,6 +520,8 @@ struct Args {
     // Mega-simulation options
     parallel_layout: [usize; 2],
     border_interaction: bool,
+    migration_probability: f64,
+    border_thickness: usize,
     // Checkpoint options
     checkpoint_enabled: bool,
     checkpoint_interval: usize,
@@ -562,6 +575,8 @@ impl Default for Args {
             // Mega-simulation defaults
             parallel_layout: [1, 1],
             border_interaction: false,
+            migration_probability: 0.2,
+            border_thickness: 2,
             // Checkpoint defaults
             checkpoint_enabled: false,
             checkpoint_interval: 10000,
@@ -615,6 +630,8 @@ impl From<Config> for Args {
             parallel_sims: c.simulation.parallel_sims,
             parallel_layout: c.simulation.parallel_layout,
             border_interaction: c.simulation.border_interaction,
+            migration_probability: c.simulation.migration_probability,
+            border_thickness: c.simulation.border_thickness,
             checkpoint_enabled: c.checkpoint.enabled,
             checkpoint_interval: c.checkpoint.interval,
             checkpoint_path: c.checkpoint.path,
@@ -636,7 +653,7 @@ impl From<Config> for Args {
             energy_source_lifetime: c.energy.dynamic.source_lifetime,
             energy_spawn_rate: c.energy.dynamic.spawn_rate,
             energy_sim_groups: c.energy.sim_groups.clone(),
-            // Metrics
+            // Metrics settings
             metrics_enabled: c.metrics.enabled,
             metrics_interval: c.metrics.interval,
             metrics_output_file: c.metrics.output_file,
@@ -976,7 +993,7 @@ fn main() {
     // Build energy config for GPU backends
     #[allow(unused_variables)]
     let gpu_energy_config = if args.energy_enabled {
-        Some(energy::EnergyConfig::full_with_options(
+        let ec = energy::EnergyConfig::full_with_options(
             args.grid_width,
             args.grid_height,
             args.energy_radius,
@@ -990,7 +1007,9 @@ fn main() {
             args.seed,
             args.energy_spontaneous_rate,
             args.energy_shape.clone(),
-        ))
+            args.border_thickness,
+        );
+        Some(ec)
     } else {
         None
     };
@@ -1090,6 +1109,7 @@ fn main() {
                 args.steps_per_run as u32,
                 gpu_energy_config.as_ref(),
                 per_sim_configs.clone(),
+                args.border_thickness,
             ) {
                 Ok(mut cuda_sim) => {
                     let [layout_cols, layout_rows] = args.parallel_layout;
@@ -1106,7 +1126,7 @@ fn main() {
                     if effective_border_interaction {
                         let mega_pairs = generate_mega_pairs(
                             num_programs, args.grid_width, args.grid_height, args.neighbor_range,
-                            args.parallel_sims, layout_cols, layout_rows,
+                            args.parallel_sims, layout_cols, layout_rows, args.migration_probability,
                         );
                         cuda_sim.set_mega_mode(true);
                         cuda_sim.set_pairs_mega(&mega_pairs);
@@ -1134,6 +1154,8 @@ fn main() {
                         args.thumbnail_scale,
                         args.parallel_layout,
                         effective_border_interaction,
+                        args.migration_probability,
+                        args.border_thickness,
                         args.checkpoint_enabled,
                         args.checkpoint_interval,
                         &args.checkpoint_path,
@@ -1198,6 +1220,8 @@ fn main() {
                     args.neighbor_range,
                     args.parallel_layout,
                     args.border_interaction,
+                    args.migration_probability,
+                    args.border_thickness,
                     args.checkpoint_enabled,
                     args.checkpoint_interval,
                     &args.checkpoint_path,
@@ -1263,6 +1287,7 @@ fn main() {
         save_frames,
         args.frame_interval,
         args.neighbor_range,
+        args.border_thickness,
         args.energy_enabled,
         args.energy_sources,
         args.energy_radius,
@@ -1290,6 +1315,7 @@ fn run_cpu_simulation(
     save_frames: bool,
     frame_interval: usize,
     neighbor_range: usize,
+    border_thickness: usize,
     energy_enabled: bool,
     energy_sources: usize,
     energy_radius: usize,
@@ -1320,6 +1346,7 @@ fn run_cpu_simulation(
             seed,
             energy_spontaneous_rate,
             energy_shape.to_string(),
+            border_thickness,
         ))
     } else {
         None
@@ -1393,6 +1420,8 @@ fn run_cuda_simulation(
     thumbnail_scale: usize,
     parallel_layout: [usize; 2],
     mega_mode: bool,
+    migration_probability: f64,
+    border_thickness: usize,
     checkpoint_enabled: bool,
     checkpoint_interval: usize,
     checkpoint_path: &str,
@@ -1513,7 +1542,7 @@ fn run_cuda_simulation(
         if mega_mode {
             let pairs = generate_mega_pairs_seeded(
                 num_programs, grid_width, grid_height, neighbor_range,
-                num_sims, layout_cols, layout_rows, seed, epoch
+                num_sims, layout_cols, layout_rows, seed, epoch, migration_probability,
             );
             cuda_sim.set_pairs_mega(&pairs);
         } else {
@@ -1724,6 +1753,8 @@ fn run_multi_gpu_simulation(
     neighbor_range: usize,
     parallel_layout: [usize; 2],
     border_interaction: bool,
+    migration_probability: f64,
+    border_thickness: usize,
     checkpoint_enabled: bool,
     checkpoint_interval: usize,
     checkpoint_path: &str,
@@ -1789,7 +1820,7 @@ fn run_multi_gpu_simulation(
         // Mega mode: generate all pairs with absolute indices (including cross-border)
         let mega_pairs = generate_mega_pairs(
             num_programs, grid_width, grid_height, neighbor_range,
-            num_sims, layout_cols, layout_rows
+            num_sims, layout_cols, layout_rows, migration_probability,
         );
         multi_sim.set_mega_mode(true);
         multi_sim.set_pairs_mega(&mega_pairs);
@@ -1876,7 +1907,7 @@ fn run_multi_gpu_simulation(
         if effective_border_interaction {
             let pairs = generate_mega_pairs_seeded(
                 num_programs, grid_width, grid_height, neighbor_range,
-                num_sims, layout_cols, layout_rows, seed, epoch
+                num_sims, layout_cols, layout_rows, seed, epoch, migration_probability,
             );
             multi_sim.set_pairs_mega(&pairs);
         } else {
@@ -2349,18 +2380,16 @@ fn generate_mega_pairs(
     num_sims: usize,
     layout_cols: usize,
     layout_rows: usize,
+    _migration_probability: f64,
 ) -> Vec<(u32, u32)> {
     generate_mega_pairs_seeded(
         num_programs, grid_width, grid_height, neighbor_range,
-        num_sims, layout_cols, layout_rows, 0, 0
+        num_sims, layout_cols, layout_rows, 0, 0, _migration_probability
     )
 }
 
-/// Generate all pairs for mega-simulation mode with absolute indices and deterministic seeding.
-/// Includes both internal pairs (within each sim) and cross-border pairs (between adjacent sims).
-/// 
-/// Each epoch gets different pairings based on (base_seed, epoch).
-/// Cross-border pairs are randomized to ensure different edge programs interact each epoch.
+    /// Uses a unified mega-grid coordinate system to ensure seamless interactions at borders,
+    /// while maintaining an "island effect" via a configurable border_thickness (dead zone).
 #[cfg(any(feature = "wgpu-compute", feature = "cuda"))]
 fn generate_mega_pairs_seeded(
     num_programs: usize,
@@ -2372,6 +2401,7 @@ fn generate_mega_pairs_seeded(
     layout_rows: usize,
     base_seed: u64,
     epoch: usize,
+    _migration_probability: f64,
 ) -> Vec<(u32, u32)> {
     use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
@@ -2380,115 +2410,74 @@ fn generate_mega_pairs_seeded(
     let seed = base_seed.wrapping_add(epoch as u64).wrapping_mul(0x9E3779B97F4A7C15);
     let mut rng = StdRng::seed_from_u64(seed);
     
-    let mut all_pairs = Vec::new();
-    
-    // Track which programs are already paired (globally)
+    let mega_width = grid_width * layout_cols;
+    let mega_height = grid_height * layout_rows;
     let total_programs = num_programs * num_sims;
+    
+    let mut all_pairs = Vec::with_capacity(total_programs / 2);
     let mut available = vec![true; total_programs];
     
-    // Collect all potential cross-border edges, then shuffle them
-    let mut cross_border_candidates: Vec<(usize, usize)> = Vec::new();
-    
-    for sim_row in 0..layout_rows {
-        for sim_col in 0..layout_cols {
-            let sim_idx = sim_row * layout_cols + sim_col;
-            let sim_offset = sim_idx * num_programs;
-            
-            // Right neighbor
-            if sim_col + 1 < layout_cols {
-                let neighbor_sim = sim_row * layout_cols + (sim_col + 1);
-                let neighbor_offset = neighbor_sim * num_programs;
-                
-                // Collect all right-left edge pairs
-                for y in 0..grid_height {
-                    let local_p1 = y * grid_width + (grid_width - 1);
-                    let global_p1 = sim_offset + local_p1;
-                    let local_p2 = y * grid_width + 0;
-                    let global_p2 = neighbor_offset + local_p2;
-                    cross_border_candidates.push((global_p1, global_p2));
-                }
-            }
-            
-            // Bottom neighbor  
-            if sim_row + 1 < layout_rows {
-                let neighbor_sim = (sim_row + 1) * layout_cols + sim_col;
-                let neighbor_offset = neighbor_sim * num_programs;
-                
-                // Collect all bottom-top edge pairs
-                for x in 0..grid_width {
-                    let local_p1 = (grid_height - 1) * grid_width + x;
-                    let global_p1 = sim_offset + local_p1;
-                    let local_p2 = 0 * grid_width + x;
-                    let global_p2 = neighbor_offset + local_p2;
-                    cross_border_candidates.push((global_p1, global_p2));
-                }
-            }
-        }
-    }
-    
-    // Shuffle cross-border candidates so different edges get paired each epoch
-    for i in (1..cross_border_candidates.len()).rev() {
+    // Shuffle all programs across the entire mega-grid to give everyone an equal chance to pair
+    let mut order: Vec<usize> = (0..total_programs).collect();
+    for i in (1..order.len()).rev() {
         let j = rng.random_range(0..=i);
-        cross_border_candidates.swap(i, j);
+        order.swap(i, j);
     }
     
-    // FIRST: Process shuffled cross-border pairs
-    for (global_p1, global_p2) in cross_border_candidates {
-        if available[global_p1] && available[global_p2] {
-            all_pairs.push((global_p1 as u32, global_p2 as u32));
-            available[global_p1] = false;
-            available[global_p2] = false;
-        }
-    }
-    
-    // SECOND: Generate internal pairs for each simulation with shuffled order
-    for sim_idx in 0..num_sims {
-        let sim_offset = sim_idx * num_programs;
-        
-        // Shuffle the order in which we process programs within this sim
-        let mut order: Vec<usize> = (0..num_programs).collect();
-        for i in (1..order.len()).rev() {
-            let j = rng.random_range(0..=i);
-            order.swap(i, j);
+    for &i in &order {
+        if !available[i] {
+            continue;
         }
         
-        for &local_i in &order {
-            let global_i = sim_offset + local_i;
-            if !available[global_i] {
-                continue;
-            }
-            
-            let x = local_i % grid_width;
-            let y = local_i / grid_width;
-            
-            // Find available neighbors within this simulation
-            // NOTE: No toroidal wrapping in mega mode - edge cells connect via cross-border pairs only
-            let mut neighbors = Vec::new();
-            for dx in -(neighbor_range as i32)..=(neighbor_range as i32) {
-                for dy in -(neighbor_range as i32)..=(neighbor_range as i32) {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    // Skip if outside simulation bounds (no toroidal wrap)
-                    if nx < 0 || nx >= grid_width as i32 || ny < 0 || ny >= grid_height as i32 {
-                        continue;
-                    }
-                    let local_neighbor = (ny as usize) * grid_width + (nx as usize);
-                    let global_neighbor = sim_offset + local_neighbor;
-                    if available[global_neighbor] {
-                        neighbors.push(global_neighbor);
-                    }
+        // Convert global index to mega-grid coordinates
+        let sim_idx = i / num_programs;
+        let local_idx = i % num_programs;
+        let sim_x = sim_idx % layout_cols;
+        let sim_y = sim_idx / layout_cols;
+        
+        let local_x = local_idx % grid_width;
+        let local_y = local_idx / grid_width;
+        
+        let mega_x = sim_x * grid_width + local_x;
+        let mega_y = sim_y * grid_height + local_y;
+        
+        // Find available neighbors in the mega-grid
+        let mut neighbors = Vec::new();
+        let r = neighbor_range as i32;
+        
+        for dx in -r..=r {
+            for dy in -r..=r {
+                if dx == 0 && dy == 0 { continue; }
+                
+                // Unified toroidal wrap for the entire mega-grid
+                let nx = (mega_x as i32 + dx).rem_euclid(mega_width as i32) as usize;
+                let ny = (mega_y as i32 + dy).rem_euclid(mega_height as i32) as usize;
+                
+                // Convert global mega-coordinates back to global index
+                let n_sim_x = nx / grid_width;
+                let n_sim_y = ny / grid_height;
+                let n_sim_idx = n_sim_y * layout_cols + n_sim_x;
+                
+                let n_local_x = nx % grid_width;
+                let n_local_y = ny % grid_height;
+                let n_local_idx = n_local_y * grid_width + n_local_x;
+                
+                let n_global_idx = n_sim_idx * num_programs + n_local_idx;
+                
+                if available[n_global_idx] {
+                    // Physical dead zone approach: interactions are always allowed if program is available.
+                    // The "island effect" is enforced by the zero-energy zone in the energy map.
+                    neighbors.push(n_global_idx);
                 }
             }
-            
-            if !neighbors.is_empty() {
-                let partner = neighbors[rng.random_range(0..neighbors.len())];
-                all_pairs.push((global_i as u32, partner as u32));
-                available[global_i] = false;
-                available[partner] = false;
-            }
+        }
+        
+        if !neighbors.is_empty() {
+            let partner_idx = rng.random_range(0..neighbors.len());
+            let partner = neighbors[partner_idx];
+            all_pairs.push((i as u32, partner as u32));
+            available[i] = false;
+            available[partner] = false;
         }
     }
     
