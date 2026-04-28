@@ -6,17 +6,38 @@ A high-performance GPU-accelerated implementation of self-modifying program soup
 
 This project simulates a "primordial soup" of programs that can interact, mutate, and potentially evolve self-replicating behavior. Programs are written in BFF (Brainfuck Family), a minimal instruction set that supports:
 
-- Two read/write heads operating on a shared tape
-- Copy operations between program pairs
-- Random mutations
-- 2D toroidal grid topology for spatial structure
+- Two read/write heads on a shared 128-byte tape (64 bytes per program)
+- Copy operations between paired programs
+- Stochastic mutations
+- 2D spatial topology with neighbor pairing
 
-The simulation includes an optional **energy system** that creates localized zones where mutation is permitted, adding evolutionary pressure and spatial dynamics. The intent is to see if our replicators can compute logic of the underlying simulation as a means to survive. If the hypothesis is feasible through running the simulation, I believe this method can be expanded to other simulations of our world that can lead to new ways of evolving artifical intelligence architectures, rather than pre-determining  them. 
+An optional **energy system** adds evolutionary pressure by restricting mutation to localized zones, forcing programs to adapt to their environment for survival and reproduction. 
 
+## BFF Instruction Set
+
+| Instruction | Description |
+|-------------|-------------|
+| `<` `>` | Move head 0 left/right |
+| `{` `}` | Move head 1 left/right |
+| `+` `-` | Increment/decrement byte at head 0 |
+| `.` | Copy byte from head 0 to head 1 |
+| `,` | Copy byte from head 1 to head 0 |
+| `[` `]` | Loop (jump if byte at head 0 is zero/non-zero) |
+
+Programs are paired and execute on a combined 128-byte tape (64 bytes from each program).
+
+## Key Features
+
+- **GPU Acceleration**: CUDA (NVIDIA, no buffer limits) or WGPU (Vulkan/Metal, cross-platform), plus CPU fallback
+- **Batched Simulations**: Run hundreds of parallel simulations simultaneously with different parameters
+- **Mega-Simulation Mode**: Grid of sub-simulations with cross-border program interactions
+- **Energy System**: Dynamic energy zones with configurable shapes (circles, strips, ellipses, etc.)
+- **Metrics Tracking**: Brotli compression ratio analysis to detect phase transitions and self-replicator emergence
+- **Checkpointing**: Save and resume complete simulation state
+- **Async I/O**: Non-blocking data saves and post-processing frame rendering
+- **YAML Configuration**: Simple text-based configuration
 
 ## Inspirations
-
-This implementation is directly derived from the paper:
 
 > **Computational Life: How Well-formed, Self-replicating Programs Emerge from Simple Interaction**  
 > Blaise Aguera y Arcas, Jyrki Alakuijala, James Evans, Ben Laurie, Alexander Mordvintsev, Eyvind Niklasson, Ettore Randazzo, Luca Versari  
@@ -31,38 +52,16 @@ The "energy" portion of this implementation is also inspired by research done on
 > Reid CR. Thoughts from the forest floor: a review of cognition in the slime mould Physarum polycephalum. Anim Cogn. 2023 Nov;26(6):1783-1797. doi: 10.1007/s10071-023-01782-1. Epub 2023 May 11. 
 > PMID: 37166523; PMCID: PMC10770251.
 > https://pmc.ncbi.nlm.nih.gov/articles/PMC10770251/
-
-## Background
-
-This Rust implementation provides:
-- GPU acceleration via CUDA (NVIDIA, fastest, no buffer limits) or wgpu (Vulkan/Metal, cross-platform)
-- Batched parallel simulations (run multiple seeds simultaneously)
-- Mega-simulation mode (parallel sims arranged in a grid with cross-border interaction)
-- Configurable energy zones with variable shapes for spatial evolutionary dynamics
-- Simulation groups for comparative experiments with different evolutionary pressures
-- Checkpointing for saving and resuming simulations
-- Async raw data saving for maximum simulation speed
-- Post-simulation frame rendering
-- YAML configuration files
-- Video generation from simulation frames
-
 ## Requirements
 
 - Rust 1.70+
-- GPU with Vulkan, Metal, or CUDA support (for GPU acceleration)
+- GPU (optional but recommended): NVIDIA (CUDA), AMD/Intel (Vulkan), or Apple (Metal)
 - ffmpeg (for video generation)
 
-### Compute Backends
-
-The simulation supports three compute backends, configurable via the `backend` field in config.yaml:
-
-| Backend | Requirements | Buffer Limit | Performance |
-|---------|--------------|--------------|-------------|
-| `cuda` | NVIDIA GPU + CUDA toolkit | None (full GPU memory) | Fastest |
-| `wgpu` | Any GPU with Vulkan/Metal | 4GB per buffer | Good |
-| `cpu` | None | System RAM | Slow (fallback) |
-
-For NVIDIA GPUs, CUDA is recommended as it has no buffer size limits and is typically faster. For AMD, Intel, or Apple GPUs, wgpu provides cross-platform support via Vulkan or Metal.
+**Compute Backends:**
+- `cuda`: NVIDIA GPU (fastest, no buffer limits)
+- `wgpu`: Cross-platform GPU via Vulkan/Metal (4GB buffer limit)
+- `cpu`: Fallback (slow)
 
 ## Installation
 
@@ -119,200 +118,132 @@ USE_CONFIG_DIRS=true ./run.sh
 
 ## Configuration
 
-Create a `config.yaml` file to configure the simulation:
+Create a `config.yaml` file to configure the simulation. Key options:
 
 ```yaml
-# Compute backend
-# Options: "cuda" (fastest, NVIDIA only, no buffer limit)
-#          "wgpu" (cross-platform GPU via Vulkan/Metal, 4GB limit)
-#          "cpu"  (fallback, slow but always works)
-backend: "cuda"
-
-# Grid dimensions
+# Grid size per simulation
 grid:
   width: 1024
   height: 1024
 
-# Core simulation parameters
+# Core simulation
 simulation:
-  seed: 42                      # Random seed for reproducibility
-  mutation_rate: 2048           # 1 in N chance per byte (higher = less mutation)
+  seed: 42
+  mutation_rate: 2048           # 1 in N chance per byte
   steps_per_run: 4096           # BFF execution steps per epoch
-  max_epochs: 1000000           # Total epochs to run
-  neighbor_range: 2             # Pairing range (2 = 5x5 neighborhood)
-  auto_terminate_dead_epochs: 0 # Terminate if all dead for N epochs (0=disabled)
-  parallel_sims: 256            # Run N simulations in parallel on GPU
-  parallel_layout: [16, 16]     # Arrange as [cols, rows] grid for mega-simulation
-  border_interaction: true      # Enable cross-simulation pairing at borders
+  max_epochs: 1000000
+  neighbor_range: 2             # Spatial pairing range
+  parallel_sims: 256            # Run N simulations in parallel
+  parallel_layout: [16, 16]     # Grid layout for mega-simulation
+  border_interaction: true      # Enable cross-border program pairing
+  border_thickness: 2           # Dead zone width between simulations
 
-# Output settings
+# Output
 output:
-  frame_interval: 256           # Save every N epochs (0 = disabled)
-  frames_dir: "frames"          # Output directory (relative or absolute)
-  frame_format: "png"           # "png" (compressed) or "ppm" (uncompressed)
-  thumbnail_scale: 4            # Downscale factor (1 = full, 4 = 1/4 size)
-  
-  # Raw data saving (for post-simulation rendering)
-  save_raw: false               # Save raw soup data (fast binary dumps)
-  raw_dir: "raw_data"           # Directory for raw data files
-  async_save: true              # Save in background thread (non-blocking)
-  render_frames: true           # Render frames during simulation
+  frame_interval: 256           # Save every N epochs
+  frames_dir: "frames"
+  frame_format: "png"           # png/ppm/jpeg
+  save_raw: true                # Save binary data for post-processing
+  async_save: true              # Non-blocking saves
 
-# Checkpoint settings
+# Checkpointing
 checkpoint:
-  enabled: true                 # Enable checkpointing
-  interval: 50000               # Save every N epochs (0 = only at end)
-  path: "checkpoints"           # Directory for checkpoint files
-  resume_from: ""               # Path to checkpoint to resume (empty = fresh start)
+  enabled: true
+  interval: 50000
+  path: "checkpoints"
+  resume_from: ""               # Path to resume from
 
 # Energy system
 energy:
   enabled: true
-  sources: 6                    # Number of sources (1-8)
-  radius: 64                    # Radius of each source
-  reserve_epochs: 50000         # Reserve energy when leaving zone
-  death_epochs: 10000           # Epochs without interaction until death (0 = infinite)
-  spontaneous_rate: 10          # 1 in N chance for dead tape in zone to respawn (0=disabled)
-  shape: "random"               # Shape: circle, strip_h, strip_v, half_circle,
-                                # half_circle_bottom, half_circle_left, half_circle_right,
-                                # ellipse, ellipse_v, random
+  sources: 6                    # Number of energy zones
+  radius: 64
+  reserve_epochs: 50000         # Energy reserve when leaving zone
+  death_epochs: 10000           # Timeout before death (0 = immortal)
+  spontaneous_rate: 10          # 1 in N chance to respawn dead programs
+  shape: "random"               # circle, ellipse, strip_h, strip_v, half_circle_*
   
-  # Dynamic energy settings
   dynamic:
-    random_placement: true      # Randomize source positions
-    max_sources: 10             # Maximum simultaneous sources
-    source_lifetime: 10000      # Epochs until source expires (0 = infinite)
-    spawn_rate: 5000            # Spawn new source every N epochs (0 = disabled)
-
-  # Per-Simulation Groups (optional)
-  # Run different death_epochs across simulations in a single run.
-  # Useful for comparing different evolutionary pressures.
+    random_placement: true      # Randomize positions per sim
+    source_lifetime: 10000      # Expire after N epochs (0 = permanent)
+    spawn_rate: 5000            # Spawn new source every N epochs
+  
+  # Optional: Different death timers per simulation group
   sim_groups:
-    - death_epochs: 10000       # 85 sims die after 10k epochs without interaction
+    - death_epochs: 10000
       count: 85
-    - death_epochs: 100000      # 85 sims die after 100k epochs
+    - death_epochs: 100000
       count: 85
-    - death_epochs: 0           # 86 sims are immortal (never die from timeout)
+    - death_epochs: 0           # Immortal
       count: 86
+
+# Metrics (optional)
+metrics:
+  enabled: true                 # Track compression ratio
+  interval: 1000
+  output_file: "metrics.csv"
 ```
 
 ## Energy System
 
-The energy system adds spatial structure to the simulation:
+The energy system creates spatial evolutionary pressure:
 
-- **Energy Sources**: Fixed or randomly placed zones on the grid with configurable shapes
-- **Mutation Permission**: Only programs within energy zones (or with reserve energy) can mutate
-- **Reserve Energy**: Programs leaving an energy zone retain mutation ability for a limited time
-- **Death Timer**: Programs outside energy zones that don't interact for too long become inactive (set to 0 for immortal programs)
-- **Dynamic Sources**: Sources can spawn, expire, and move over time
-- **Spontaneous Generation**: Dead tapes within energy zones can randomly spawn new programs
-- **Per-Simulation Variation**: Each parallel simulation gets unique energy field positions
-- **Simulation Groups**: Run different death_epochs across simulations for comparative experiments
-
-### Energy Zone Shapes
-
-Available shapes for energy zones:
-- `circle` - Standard circular zone
-- `strip_h` - Horizontal strip
-- `strip_v` - Vertical strip
-- `half_circle` - Top half of a circle
-- `half_circle_bottom` - Bottom half of a circle
-- `half_circle_left` - Left half of a circle
-- `half_circle_right` - Right half of a circle
-- `ellipse` - Horizontal ellipse
-- `ellipse_v` - Vertical ellipse
-- `random` - Random shape per source
+- **Energy Zones**: Configurable shapes (circle, ellipse, strip, half-circle) placed strategically or randomly
+- **Mutation Control**: Only programs in zones or with reserve energy can mutate
+- **Reserve Energy**: Temporary mutation ability when leaving a zone
+- **Death Timer**: Programs die if isolated too long outside zones (configurable, 0 = immortal)
+- **Spontaneous Generation**: Dead programs in zones can randomly respawn with new code
+- **Dynamic Behavior**: Sources spawn, expire, and move over time
+- **Per-Simulation Variation**: Each parallel sim gets unique energy field positions
+- **Simulation Groups**: Compare different death timers across batched simulations
 
 ## Mega-Simulation Mode
 
-When `border_interaction` is enabled, parallel simulations are arranged in a grid where adjacent simulations can interact at their borders:
+Enable `border_interaction` to arrange parallel simulations in a grid where adjacent sims can exchange programs:
 
 ```yaml
 simulation:
   parallel_sims: 256
-  parallel_layout: [16, 16]   # 16x16 grid of simulations
-  border_interaction: true    # Enable cross-border pairing
+  parallel_layout: [16, 16]   # 16x16 grid of sub-simulations
+  border_interaction: true
 ```
 
-This creates a single large simulation grid (e.g., 4096x4096 programs for 16x16 layout of 256x256 sims) where programs at simulation edges can pair with programs in adjacent simulations. This enables genetic information to flow across the entire mega-grid.
+This creates a single large grid (e.g., 16×16 layout of 256×256 sims = 4096×4096 total programs) where genetic information flows across simulation boundaries.
 
-Cross-border pairs are generated first to ensure edge programs interact with neighbors, then internal pairs fill in the remaining programs.
+## Checkpointing and Post-Processing
 
-## Checkpointing
-
-Save and restore complete simulation state:
+**Checkpoints** save complete simulation state (soup, energy states, epoch, config) in a binary format with YAML header:
 
 ```yaml
 checkpoint:
   enabled: true
-  interval: 10000            # Save every 10000 epochs
-  path: "checkpoints"
-  resume_from: ""            # Set to checkpoint path to resume
-```
-
-Checkpoint files contain:
-- All program tapes (soup data)
-- Energy states (reserve, timer, dead status)
-- Current epoch
-- Configuration metadata for validation
-
-To resume from a checkpoint:
-```yaml
-checkpoint:
+  interval: 10000
   resume_from: "checkpoints/checkpoint_epoch_00010000_sims_256.bff"
 ```
 
-## Raw Data Saving and Post-Processing
+**Async Raw Data Saving** maximizes simulation speed by saving binary dumps in the background:
 
-For maximum simulation speed, save raw binary data during the run and render frames afterwards:
-
-### During Simulation (Maximum Speed)
 ```yaml
 output:
-  frame_interval: 128
-  save_raw: true           # Save raw soup data
-  async_save: true         # Non-blocking saves
-  render_frames: false     # Skip rendering during sim
+  save_raw: true
+  async_save: true
+  render_frames: false  # Render later for max speed
 ```
 
-### Post-Simulation Rendering
+Render frames after simulation:
 ```bash
-# Render frames from saved raw data
-./render_frames.sh /path/to/raw_data /path/to/frames
-
-# Or use the binary directly
 ./target/release/energetic-primordial-soup \
   --render-raw /path/to/raw_data \
-  --frames-dir /path/to/frames \
-  --config config.yaml
+  --frames-dir /path/to/frames
 ```
-
-Raw data files are compact binary dumps (~16MB for 256 sims at 256x256). The async writer ensures saves happen in a background thread without blocking the GPU.
 
 ## Output
 
-The simulation generates:
-
-- **Frames**: PNG, JPEG, or PPM images showing program state (color-coded by byte values)
-- **MP4 videos**: Compressed videos created from frames via ffmpeg
-- **Log files**: Simulation statistics and progress
-- **Checkpoints**: Binary files for resuming simulations
-- **Raw data**: Binary soup dumps for post-processing
-
-When running mega-simulations, a combined frame shows all simulations arranged in their grid layout.
-
-## BFF Instruction Set
-
-| Instruction | Description |
-|-------------|-------------|
-| `<` `>` | Move head 0 left/right |
-| `{` `}` | Move head 1 left/right |
-| `+` `-` | Increment/decrement byte at head 0 |
-| `.` | Copy byte from head 0 to head 1 |
-| `,` | Copy byte from head 1 to head 0 |
-| `[` `]` | Loop (jump if byte at head 0 is zero/non-zero) |
-
-Programs are paired and execute on a combined 128-byte tape (64 bytes from each program).
+- **Frames**: PNG/JPEG/PPM images color-coded by byte values
+- **Videos**: MP4 via ffmpeg from frame sequences
+- **Checkpoints**: Binary files with complete simulation state
+- **Raw Data**: Fast binary dumps for post-processing
+- **Metrics CSV**: Compression ratio and phase transition tracking
 
 ## License
 
@@ -327,21 +258,14 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+Programs execute in pairs on a 128-byte tape (64 bytes each).
 
 ## References
 
-1. Aguera y Arcas, B., et al. (2024). "Computational Life: How Well-formed, Self-replicating Programs Emerge from Simple Interaction." arXiv:2406.19108. https://arxiv.org/abs/2406.19108
+- Aguera y Arcas, B., et al. (2024). "Computational Life: How Well-formed, Self-replicating Programs Emerge from Simple Interaction." arXiv:2406.19108
+- CuBFF - Original CUDA implementation: https://github.com/paradigms-of-intelligence/cubff
+- Reid CR. (2023). "Cognition in the slime mould Physarum polycephalum." Anim Cogn. 26(6):1783-1797
 
-2. CuBFF - Original CUDA implementation. https://github.com/paradigms-of-intelligence/cubff
+## License
 
-3. Reid CR. Thoughts from the forest floor: a review of cognition in the slime mould Physarum polycephalum. Anim Cogn. 2023 Nov;26(6):1783-1797. doi: 10.1007/s10071-023-01782-1. Epub 2023 May 11.  PMID: 37166523; PMCID: PMC10770251. https://pmc.ncbi.nlm.nih.gov/articles/PMC10770251/
-
-## Acknowledgments
-
-This implementation builds upon the foundational research by the Paradigms of Intelligence team at Google, exploring how self-replicating programs can emerge from simple computational substrates without explicit fitness landscapes.
+Apache License 2.0 - see LICENSE file for details.

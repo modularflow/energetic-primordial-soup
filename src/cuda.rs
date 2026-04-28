@@ -15,7 +15,21 @@ use cudarc::driver::*;
 #[cfg(feature = "cuda")]
 use cudarc::driver::result;
 #[cfg(feature = "cuda")]
+use cudarc::driver::safe::CudaStream;
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys::{CUevent, CUevent_flags};
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
+
+/// BFF command bytes (used for non-op init - these are EXCLUDED to keep programs inert).
+#[cfg(feature = "cuda")]
+const BFF_COMMAND_BYTES: [u8; 10] = [b'<', b'>', b'{', b'}', b'+', b'-', b'.', b',', b'[', b']'];
+
+/// Returns true if `b` is a BFF command byte.
+#[cfg(feature = "cuda")]
+fn is_bff_command(b: u8) -> bool {
+    BFF_COMMAND_BYTES.contains(&b)
+}
 
 /// Generate simple pairs for simulation (adjacent programs)
 #[cfg(feature = "cuda")]
@@ -570,21 +584,50 @@ extern "C" __global__ void bff_batched_evaluate(
 "#;
 
 /// CUDA-based multi-simulation
+///
+/// Uses two CUDA streams for concurrent compute + host/device transfers:
+/// - `compute_stream`: all kernel launches and ops-buffer zeroing
+/// - `xfer_stream`: all DtoH readbacks (ops counter, soup) and HtoD uploads (pairs, energy map)
+///
+/// Ordering between the streams is enforced with lightweight CUDA events so the
+/// host only blocks when it actually needs data, rather than via a global
+/// `device.synchronize()` after every step.
 #[cfg(feature = "cuda")]
 pub struct CudaMultiSimulation {
     device: Arc<CudaDevice>,
     soup_gpu: CudaSlice<u8>,
+    /// Pre-allocated at the maximum pair count (`num_sims * num_programs` u32s =
+    /// `total_programs/2` pairs × 2 u32 each). Actual in-use length is `num_pairs * 2`.
     pairs_gpu: CudaSlice<u32>,
     energy_state_gpu: CudaSlice<u32>,
     sim_configs_gpu: CudaSlice<u32>,
     energy_map_gpu: CudaSlice<u32>,
-    // Double-buffered ops counters for async readback
-    ops_count_gpu_a: CudaSlice<u64>,
-    ops_count_gpu_b: CudaSlice<u64>,
-    ops_write_to_a: bool,  // true = kernel writes to A, read from B
-    last_ops: u64,         // cached ops from previous epoch
+    /// Single ops counter. Zeroed before each kernel launch on `compute_stream`,
+    /// then DtoH'd on `xfer_stream` after `kernel_done_event` fires.
+    ops_gpu: CudaSlice<u64>,
     kernel: CudaFunction,
-    // Config
+
+    // --- Streams & events for dual-stream execution -----------------------
+    compute_stream: CudaStream,
+    xfer_stream: CudaStream,
+    /// Recorded on `compute_stream` after each kernel launch. `xfer_stream`
+    /// waits on it before reading the ops counter or the soup.
+    kernel_done_event: CUevent,
+    /// Recorded on `xfer_stream` after the pair HtoD completes.
+    /// `compute_stream` waits on it before the next kernel launch.
+    pairs_ready_event: CUevent,
+
+    // --- Host-side staging buffers ----------------------------------------
+    /// Owned host buffer for pairs. `memcpy_htod_async` references this slice,
+    /// so it must live until the HtoD copy completes (guaranteed by the
+    /// `xfer_stream` sync at the top of `set_pairs_*`).
+    pairs_host: Vec<u32>,
+    /// 1-element host buffer used as the DtoH target for the ops counter.
+    pending_ops: Vec<u64>,
+    /// Async readback buffer for the full soup (allocated lazily).
+    pending_readback: Option<Vec<u8>>,
+
+    // --- Config -----------------------------------------------------------
     num_sims: usize,
     num_programs: usize,
     num_pairs: usize,
@@ -598,14 +641,39 @@ pub struct CudaMultiSimulation {
     mega_mode: bool,
     spontaneous_rate: u32,
     border_thickness: usize,
-    pending_readback: Option<Vec<u8>>,
+    /// Ops from the previous kernel launch (cached on each `step()`).
+    last_ops: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaMultiSimulation {
+    fn drop(&mut self) {
+        // Make sure no more work is queued on either stream before destroying
+        // events (the streams themselves are cleaned up by `CudaStream::drop`).
+        let _ = unsafe { result::stream::synchronize(self.compute_stream.stream) };
+        let _ = unsafe { result::stream::synchronize(self.xfer_stream.stream) };
+        unsafe {
+            let _ = result::event::destroy(self.kernel_done_event);
+            let _ = result::event::destroy(self.pairs_ready_event);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
 impl CudaMultiSimulation {
     /// Create a new CUDA multi-simulation
-    /// 
+    ///
     /// Unlike wgpu, CUDA has no 4GB buffer limit - you can use your full GPU memory.
+    ///
+    /// `nonop_rate` (0.0..=1.0): fraction of programs that start as a "non-op"
+    /// program - 64 bytes drawn uniformly from the 246 non-command byte values.
+    /// These programs execute as pure NOPs at epoch 0 but their bytes can still
+    /// be read/written by partners during interaction. `0.0` = all random.
+    ///
+    /// `init_region`: optional (width, height) of a centered "active"
+    /// sub-region within each sim's grid. Cells outside this region are
+    /// forced to non-op at init, creating a non-op buffer zone. `None` =
+    /// the full grid is active.
     pub fn new(
         num_sims: usize,
         num_programs: usize,
@@ -617,31 +685,32 @@ impl CudaMultiSimulation {
         energy_config: Option<&crate::energy::EnergyConfig>,
         per_sim_configs: Option<Vec<(u32, u32)>>,
         border_thickness: usize,
+        nonop_rate: f32,
+        init_region: Option<(usize, usize)>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize CUDA
         let device = CudaDevice::new(0)?;
-        
-        // Note: cudarc 0.12 doesn't expose device properties directly
-        // We'll just print a simple message
+
         println!("CUDA Device: Initialized successfully");
-        
-        // Calculate memory requirements
+
+        // Calculate memory requirements (pairs sized at MAX possible - mega mode)
         let total_programs = num_sims * num_programs;
         let soup_size = total_programs * 64;
         let energy_size = total_programs * 4;
-        let pairs_size = (num_programs / 2) * 2 * 4;
+        let max_pairs = total_programs / 2;
+        let pairs_size = max_pairs * 2 * 4;
         let sim_configs_size = num_sims * 2 * 4;
         let energy_map_size = ((total_programs + 31) / 32) * 4;
-        
+
         let total_required = soup_size + energy_size + pairs_size + sim_configs_size + energy_map_size;
         println!("  Memory required: {:.2} GB", total_required as f64 / 1e9);
         println!("  Total programs: {} ({} sims × {} programs/sim)", total_programs, num_sims, num_programs);
-        
+
         // Compile kernel using nvrtc
         let ptx = cudarc::nvrtc::compile_ptx(BFF_CUDA_KERNEL)?;
         device.load_ptx(ptx, "bff", &["bff_batched_evaluate"])?;
         let kernel = device.get_func("bff", "bff_batched_evaluate").unwrap();
-        
+
         // Initialize data on CPU first
         let num_pairs = num_programs / 2;
         let energy_enabled = energy_config
@@ -650,13 +719,7 @@ impl CudaMultiSimulation {
         let default_death = energy_config.map(|c| c.interaction_death).unwrap_or(10);
         let default_reserve = energy_config.map(|c| c.reserve_duration).unwrap_or(5);
         let spontaneous_rate = energy_config.map(|c| c.spontaneous_rate).unwrap_or(0);
-        
-        // Pairs (same for all sims - local indices)
-        let pairs: Vec<u32> = generate_pairs(num_programs)
-            .into_iter()
-            .flat_map(|(a, b)| [a as u32, b as u32])
-            .collect();
-        
+
         // Per-sim configs
         let sim_configs: Vec<u32> = match per_sim_configs {
             Some(configs) if !configs.is_empty() => {
@@ -673,7 +736,7 @@ impl CudaMultiSimulation {
                     .collect()
             }
         };
-        
+
         // Energy map (precomputed zones, with per-sim offsets and border thickness)
         let energy_map = compute_energy_map(
             energy_config,
@@ -683,26 +746,131 @@ impl CudaMultiSimulation {
             grid_height,
             border_thickness,
         );
-        
-        // Soup with random data
+
+        // Soup initialization. Most programs get fully random bytes; with
+        // probability `nonop_rate` a program is replaced with 64 random
+        // non-command bytes (a pure-NOP program). If `init_region` is set,
+        // cells outside the centered active sub-region are unconditionally
+        // forced to non-op (buffer zone).
         use rand::Rng;
         let mut rng = rand::rng();
-        let soup: Vec<u8> = (0..soup_size).map(|_| rng.random()).collect();
-        
-        
-        // Energy states (all alive with full reserve)
+        let nonop_rate = nonop_rate.clamp(0.0, 1.0);
+        let mut soup: Vec<u8> = (0..soup_size).map(|_| rng.random()).collect();
+
+        // Compute active-region bounds (centered within each sim's grid).
+        let (active_w, active_h) = init_region
+            .map(|(w, h)| (w.min(grid_width), h.min(grid_height)))
+            .unwrap_or((grid_width, grid_height));
+        let has_buffer = active_w < grid_width || active_h < grid_height;
+        let active_x0 = (grid_width - active_w) / 2;
+        let active_y0 = (grid_height - active_h) / 2;
+        let active_x1 = active_x0 + active_w;
+        let active_y1 = active_y0 + active_h;
+
+        let mut nonop_count_active: usize = 0;
+        let mut nonop_count_buffer: usize = 0;
+        if nonop_rate > 0.0 || has_buffer {
+            for prog_idx in 0..total_programs {
+                let local_idx = prog_idx % num_programs;
+                let x = local_idx % grid_width;
+                let y = local_idx / grid_width;
+                let in_active = x >= active_x0 && x < active_x1
+                    && y >= active_y0 && y < active_y1;
+
+                let make_nonop = if !in_active {
+                    true
+                } else if nonop_rate > 0.0 {
+                    rng.random::<f32>() < nonop_rate
+                } else {
+                    false
+                };
+
+                if make_nonop {
+                    let base = prog_idx * 64;
+                    for b in &mut soup[base..base + 64] {
+                        loop {
+                            let v: u8 = rng.random();
+                            if !is_bff_command(v) {
+                                *b = v;
+                                break;
+                            }
+                        }
+                    }
+                    if in_active {
+                        nonop_count_active += 1;
+                    } else {
+                        nonop_count_buffer += 1;
+                    }
+                }
+            }
+
+            let total_active_cells = active_w * active_h * num_sims;
+            let total_buffer_cells = total_programs - total_active_cells;
+            if has_buffer {
+                println!(
+                    "  Init region: {}x{} active center at ({},{})..({},{}) per sim",
+                    active_w, active_h, active_x0, active_y0, active_x1, active_y1,
+                );
+                println!(
+                    "  Non-op init: {} active + {} buffer = {} / {} programs",
+                    nonop_count_active,
+                    nonop_count_buffer,
+                    nonop_count_active + nonop_count_buffer,
+                    total_programs,
+                );
+                println!(
+                    "    Active: {:.2}% nonop ({} / {}), Buffer: {} / {} (forced)",
+                    100.0 * nonop_count_active as f64 / total_active_cells.max(1) as f64,
+                    nonop_count_active,
+                    total_active_cells,
+                    nonop_count_buffer,
+                    total_buffer_cells,
+                );
+            } else {
+                println!(
+                    "  Non-op init: {} / {} programs ({:.2}% target, {:.2}% actual)",
+                    nonop_count_active,
+                    total_programs,
+                    nonop_rate * 100.0,
+                    100.0 * nonop_count_active as f64 / total_programs as f64,
+                );
+            }
+        }
+
+
+        // Energy states (all zero-packed: reserve=0, timer=0, dead=false)
         let packed_initial_state = 0u32;
         let energy_states: Vec<u32> = vec![packed_initial_state; total_programs];
-        
-        // Allocate AND initialize GPU buffers using htod_sync_copy (copies data in one step)
+
+        // Allocate + populate GPU buffers
         let soup_gpu = device.htod_sync_copy(&soup)?;
-        let pairs_gpu = device.htod_sync_copy(&pairs)?;
+
+        // Pairs buffer: preallocated at max size. Filled lazily by set_pairs_*.
+        let mut pairs_gpu = unsafe { device.alloc::<u32>(max_pairs * 2) }?;
+        // Seed with a simple default (adjacent pairs) for a single sim so the
+        // first epoch has something reasonable if set_pairs_* isn't called.
+        let seed_pairs: Vec<u32> = generate_pairs(num_programs)
+            .into_iter()
+            .flat_map(|(a, b)| [a as u32, b as u32])
+            .collect();
+        if !seed_pairs.is_empty() {
+            device.htod_sync_copy_into(&seed_pairs, &mut pairs_gpu.slice_mut(..seed_pairs.len()))?;
+        }
+        let mut pairs_host: Vec<u32> = Vec::with_capacity(max_pairs * 2);
+        pairs_host.extend_from_slice(&seed_pairs);
+
         let energy_state_gpu = device.htod_sync_copy(&energy_states)?;
         let sim_configs_gpu = device.htod_sync_copy(&sim_configs)?;
         let energy_map_gpu = device.htod_sync_copy(&energy_map)?;
-        // Double-buffered ops counters for async readback
-        let ops_count_gpu_a = device.alloc_zeros::<u64>(1)?;
-        let ops_count_gpu_b = device.alloc_zeros::<u64>(1)?;
+        let ops_gpu = device.alloc_zeros::<u64>(1)?;
+
+        // Create the two work streams (both NonBlocking, forked from default).
+        let compute_stream = device.fork_default_stream()?;
+        let xfer_stream = device.fork_default_stream()?;
+
+        // Create events (disable timing for slightly lower overhead).
+        let kernel_done_event = result::event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
+        let pairs_ready_event = result::event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
 
         Ok(Self {
             device,
@@ -711,11 +879,15 @@ impl CudaMultiSimulation {
             energy_state_gpu,
             sim_configs_gpu,
             energy_map_gpu,
-            ops_count_gpu_a,
-            ops_count_gpu_b,
-            ops_write_to_a: true,
-            last_ops: 0,
+            ops_gpu,
             kernel,
+            compute_stream,
+            xfer_stream,
+            kernel_done_event,
+            pairs_ready_event,
+            pairs_host,
+            pending_ops: vec![0u64; 1],
+            pending_readback: None,
             num_sims,
             num_programs,
             num_pairs,
@@ -729,15 +901,81 @@ impl CudaMultiSimulation {
             mega_mode: false,
             spontaneous_rate,
             border_thickness,
-            pending_readback: None,
+            last_ops: 0,
         })
     }
     
-    /// Run one epoch across all simulations
-    /// Uses double-buffered ops counter for async readback - returns previous epoch's ops
-    /// (returns 0 on first epoch since there's no previous data)
+    /// Run one epoch across all simulations.
+    ///
+    /// Dual-stream pipeline:
+    ///   1. Sync `xfer_stream` to make the previous epoch's ops readback visible.
+    ///   2. Enqueue an async HtoD of the staged `pairs_host` on `xfer_stream`,
+    ///      record `pairs_ready_event`.
+    ///   3. `compute_stream` waits on `pairs_ready_event`, then `memset_d8_async`
+    ///      zeros the ops counter and the kernel is launched on `compute_stream`.
+    ///   4. `kernel_done_event` is recorded on `compute_stream`.
+    ///   5. `xfer_stream` waits on `kernel_done_event` and starts the DtoH of
+    ///      the ops counter into `pending_ops`.
+    ///
+    /// Because the DtoH is not synced here, the host never blocks on kernel
+    /// completion inside `step()` (except via the `xfer_stream` sync at the top,
+    /// which only waits for the previous epoch's single-u64 DtoH). Returns the
+    /// ops count from the previous epoch (0 on the first epoch).
     pub fn step(&mut self) -> u64 {
-        // Calculate grid dimensions
+        use cudarc::driver::sys::CUevent_wait_flags as EWF;
+
+        // ---- 1. Retrieve previous epoch's ops via xfer_stream sync -------
+        if self.epoch > 0 {
+            unsafe {
+                if let Err(e) = result::stream::synchronize(self.xfer_stream.stream) {
+                    eprintln!("CUDA xfer_stream sync error at epoch {}: {:?}", self.epoch, e);
+                }
+            }
+            self.last_ops = self.pending_ops[0];
+        }
+
+        // ---- 2. Async HtoD of the staged pair buffer on xfer_stream ------
+        // Also enforces "previous kernel is done with pairs_gpu" because
+        // xfer_stream already waited on kernel_done_event during the previous
+        // epoch's DtoH enqueue (which completed as part of the sync above).
+        let flat_len = (self.num_pairs * 2).min(self.pairs_host.len());
+        if flat_len > 0 {
+            unsafe {
+                if let Err(e) = result::memcpy_htod_async(
+                    *self.pairs_gpu.device_ptr(),
+                    &self.pairs_host[..flat_len],
+                    self.xfer_stream.stream,
+                ) {
+                    eprintln!("CUDA pair HtoD error at epoch {}: {:?}", self.epoch, e);
+                }
+                if let Err(e) = result::event::record(self.pairs_ready_event, self.xfer_stream.stream) {
+                    eprintln!("CUDA pairs_ready record error: {:?}", e);
+                }
+            }
+        }
+
+        // ---- 3. Prepare and launch the kernel on compute_stream ----------
+        // compute_stream must wait for the pair HtoD to complete before it
+        // reads pairs_gpu.
+        unsafe {
+            if let Err(e) = result::stream::wait_event(
+                self.compute_stream.stream,
+                self.pairs_ready_event,
+                EWF::CU_EVENT_WAIT_DEFAULT,
+            ) {
+                eprintln!("CUDA compute wait_event error: {:?}", e);
+            }
+            // Zero the ops counter on compute_stream before the kernel starts.
+            if let Err(e) = result::memset_d8_async(
+                *self.ops_gpu.device_ptr(),
+                0,
+                self.ops_gpu.num_bytes(),
+                self.compute_stream.stream,
+            ) {
+                eprintln!("CUDA ops memset error: {:?}", e);
+            }
+        }
+
         let total_pairs = if self.mega_mode {
             self.num_pairs
         } else {
@@ -746,10 +984,8 @@ impl CudaMultiSimulation {
         let block_size = 256u32;
         let grid_size = ((total_pairs as u32) + block_size - 1) / block_size;
 
-        // Pack some u32 params together into u64 values for the kernel
         let params_packed1 = ((self.num_pairs as u64) << 32) | (self.num_programs as u64);
         let params_packed2 = ((self.num_sims as u64) << 32) | (self.steps_per_run as u64);
-        // Pack flags: bit0=energy_enabled, bit1=mega_mode, bits2-31=spontaneous_rate
         let flags = (if self.energy_enabled { 1u64 } else { 0u64 })
             | (if self.mega_mode { 2u64 } else { 0u64 })
             | ((self.spontaneous_rate as u64) << 2);
@@ -761,97 +997,101 @@ impl CudaMultiSimulation {
             shared_mem_bytes: 0,
         };
 
-        // Select which buffer to write to and which to read from
-        let (write_buf, read_buf) = if self.ops_write_to_a {
-            (&self.ops_count_gpu_a, &self.ops_count_gpu_b)
-        } else {
-            (&self.ops_count_gpu_b, &self.ops_count_gpu_a)
-        };
-
-        // Launch kernel writing to current buffer
         unsafe {
-            self.kernel.clone().launch(cfg, (
-                &self.soup_gpu,
-                &self.pairs_gpu,
-                &self.energy_state_gpu,
-                &self.sim_configs_gpu,
-                &self.energy_map_gpu,
-                write_buf,
-                params_packed1,
-                params_packed2,
-                params_packed3,
-                self.seed,
-                self.epoch,
-            )).expect("Kernel launch failed");
-        }
-
-        // Start async read of the OTHER buffer (previous epoch's data)
-        // This overlaps with kernel execution
-        let mut ops = [0u64];
-        if self.epoch > 0 {
-            // Use async copy - overlaps with kernel execution
-            let device_ptr = *read_buf.device_ptr();
-            let stream = *self.device.cu_stream();
-            unsafe {
-                // Start async copy while kernel is still running
-                let _ = result::memcpy_dtoh_async(&mut ops, device_ptr, stream);
+            if let Err(e) = self.kernel.clone().launch_on_stream(
+                &self.compute_stream,
+                cfg,
+                (
+                    &self.soup_gpu,
+                    &self.pairs_gpu,
+                    &self.energy_state_gpu,
+                    &self.sim_configs_gpu,
+                    &self.energy_map_gpu,
+                    &self.ops_gpu,
+                    params_packed1,
+                    params_packed2,
+                    params_packed3,
+                    self.seed,
+                    self.epoch,
+                ),
+            ) {
+                eprintln!("CUDA kernel launch failed at epoch {}: {:?}", self.epoch, e);
+            }
+            // ---- 4. Record kernel_done_event --------------------------
+            if let Err(e) = result::event::record(self.kernel_done_event, self.compute_stream.stream) {
+                eprintln!("CUDA kernel_done record error: {:?}", e);
             }
         }
 
-        // Sync and check for errors (kernel errors are caught here, also completes async copy)
-        match self.device.synchronize() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("CUDA sync error at epoch {}: {:?}", self.epoch, e);
-                return self.last_ops;
+        // ---- 5. Enqueue ops DtoH on xfer_stream (waits for kernel_done) --
+        unsafe {
+            if let Err(e) = result::stream::wait_event(
+                self.xfer_stream.stream,
+                self.kernel_done_event,
+                EWF::CU_EVENT_WAIT_DEFAULT,
+            ) {
+                eprintln!("CUDA xfer wait_event error: {:?}", e);
+            }
+            if let Err(e) = result::memcpy_dtoh_async(
+                &mut self.pending_ops[..],
+                *self.ops_gpu.device_ptr(),
+                self.xfer_stream.stream,
+            ) {
+                eprintln!("CUDA ops DtoH error: {:?}", e);
             }
         }
 
-        // Reset the read buffer for next use (it will be written to after we swap)
-        if self.epoch > 0 {
-            let read_buf_mut = if self.ops_write_to_a {
-                &mut self.ops_count_gpu_b
-            } else {
-                &mut self.ops_count_gpu_a
-            };
-            if let Err(e) = self.device.memset_zeros(read_buf_mut) {
-                eprintln!("Failed to reset ops counter: {:?}", e);
-            }
-        }
-
-        // Swap buffers for next epoch
-        self.ops_write_to_a = !self.ops_write_to_a;
         self.epoch += 1;
-
-        // Cache and return the ops (from previous epoch, or 0 if first epoch)
-        self.last_ops = ops[0];
         self.last_ops
     }
+
+    /// Block the host until all queued compute work is complete.
+    /// Use after the final `step()` when you need to make sure the last
+    /// kernel's ops count (and soup writes) are fully committed.
+    pub fn sync(&self) {
+        unsafe {
+            let _ = result::stream::synchronize(self.compute_stream.stream);
+            let _ = result::stream::synchronize(self.xfer_stream.stream);
+        }
+    }
     
-    /// Get soup data for a specific simulation
+    /// Make sure the most-recently-launched kernel has finished writing soup /
+    /// energy state. Use before any synchronous readback that runs on streams
+    /// other than `compute_stream`.
+    fn wait_for_compute(&self) {
+        unsafe {
+            let _ = result::stream::synchronize(self.compute_stream.stream);
+        }
+    }
+
+    /// Get soup data for a specific simulation (blocking).
     pub fn get_sim_soup(&self, sim_idx: usize) -> Vec<u8> {
+        self.wait_for_compute();
         let offset = sim_idx * self.num_programs * 64;
         let size = self.num_programs * 64;
-        
+
         let mut data = vec![0u8; size];
-        // Note: cudarc requires slicing for partial reads
         self.device.dtoh_sync_copy_into(
             &self.soup_gpu.slice(offset..offset + size),
             &mut data
         ).unwrap();
         data
     }
-    
-    /// Get all soup data
+
+    /// Get all soup data (blocking).
     pub fn get_all_soup(&self) -> Vec<u8> {
+        self.wait_for_compute();
         let size = self.num_sims * self.num_programs * 64;
         let mut data = vec![0u8; size];
         self.device.dtoh_sync_copy_into(&self.soup_gpu, &mut data).unwrap();
         data
     }
 
-    /// Begin async readback of all soup data. Use finish_async_readback to retrieve it.
+    /// Begin async readback of all soup data on `xfer_stream`, waiting for the
+    /// latest kernel to finish via `kernel_done_event`. Use
+    /// `finish_async_readback` to retrieve it.
     pub fn begin_async_readback(&mut self) {
+        use cudarc::driver::sys::CUevent_wait_flags as EWF;
         if self.pending_readback.is_some() {
             return;
         }
@@ -864,10 +1104,21 @@ impl CudaMultiSimulation {
             return;
         }
 
-        let device_ptr = *self.soup_gpu.device_ptr();
-        let stream = *self.device.cu_stream();
         unsafe {
-            if let Err(e) = result::memcpy_dtoh_async(&mut data, device_ptr, stream) {
+            // Ensure the current kernel is done before we start reading soup.
+            if let Err(e) = result::stream::wait_event(
+                self.xfer_stream.stream,
+                self.kernel_done_event,
+                EWF::CU_EVENT_WAIT_DEFAULT,
+            ) {
+                eprintln!("CUDA readback wait_event failed: {:?}", e);
+                return;
+            }
+            if let Err(e) = result::memcpy_dtoh_async(
+                &mut data,
+                *self.soup_gpu.device_ptr(),
+                self.xfer_stream.stream,
+            ) {
                 eprintln!("CUDA async readback failed: {:?}", e);
                 return;
             }
@@ -882,11 +1133,15 @@ impl CudaMultiSimulation {
     }
 
     /// Finish async readback and return soup data, or None if not pending.
+    /// Syncs only `xfer_stream` (not the full device), so other compute work
+    /// queued on `compute_stream` keeps running.
     pub fn finish_async_readback(&mut self) -> Option<Vec<u8>> {
         let data = self.pending_readback.take()?;
-        if let Err(e) = self.device.synchronize() {
-            eprintln!("CUDA readback sync error: {:?}", e);
-            return None;
+        unsafe {
+            if let Err(e) = result::stream::synchronize(self.xfer_stream.stream) {
+                eprintln!("CUDA readback sync error: {:?}", e);
+                return None;
+            }
         }
         Some(data)
     }
@@ -901,43 +1156,63 @@ impl CudaMultiSimulation {
     }
 
     pub fn get_all_energy_states(&self) -> Vec<u32> {
+        self.wait_for_compute();
         let size = self.num_sims * self.num_programs;
         let mut data = vec![0u32; size];
         self.device.dtoh_sync_copy_into(&self.energy_state_gpu, &mut data).unwrap();
         data
     }
 
-    /// Restore soup data from checkpoint
+    /// Stage new pair indices in the host-side buffer. The actual HtoD happens
+    /// inside the next `step()` on `xfer_stream`. Syncs `xfer_stream` first so
+    /// we don't overwrite a buffer that's still being copied.
+    fn stage_pairs(&mut self, pairs: &[(u32, u32)]) {
+        unsafe {
+            // Make sure any in-flight HtoD of pairs_host from a previous
+            // step() has completed before we mutate it.
+            let _ = result::stream::synchronize(self.xfer_stream.stream);
+        }
+        let max_pairs = self.num_sims * self.num_programs / 2;
+        let n = pairs.len().min(max_pairs);
+        self.pairs_host.clear();
+        self.pairs_host.reserve(n * 2);
+        for &(a, b) in &pairs[..n] {
+            self.pairs_host.push(a);
+            self.pairs_host.push(b);
+        }
+        self.num_pairs = n;
+    }
+
+    /// Restore soup data from checkpoint. Syncs compute first so we don't
+    /// stomp on a running kernel.
     pub fn set_all_soup(&mut self, soup: &[u8]) {
+        self.wait_for_compute();
         if let Err(e) = self.device.htod_sync_copy_into(soup, &mut self.soup_gpu) {
             eprintln!("CUDA soup restore failed: {:?}", e);
         }
     }
 
-    /// Restore energy states from checkpoint
+    /// Restore energy states from checkpoint.
     pub fn set_all_energy_states(&mut self, energy_states: &[u32]) {
+        self.wait_for_compute();
         if let Err(e) = self.device.htod_sync_copy_into(energy_states, &mut self.energy_state_gpu) {
             eprintln!("CUDA energy restore failed: {:?}", e);
         }
     }
 
-    /// Set pairs (local indices) for all simulations
+    /// Set pairs (local indices) for all simulations.
     pub fn set_pairs_all(&mut self, pairs: &[(u32, u32)]) {
-        let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
-        self.pairs_gpu = self.device.htod_sync_copy(&flat).unwrap();
-        self.num_pairs = pairs.len();
+        self.stage_pairs(pairs);
     }
 
-    /// Enable/disable mega-simulation mode (pairs are absolute indices)
+    /// Enable/disable mega-simulation mode (pairs are absolute indices).
     pub fn set_mega_mode(&mut self, enabled: bool) {
         self.mega_mode = enabled;
     }
 
-    /// Set pairs for mega mode (absolute indices across all sims)
+    /// Set pairs for mega mode (absolute indices across all sims).
     pub fn set_pairs_mega(&mut self, pairs: &[(u32, u32)]) {
-        let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
-        self.pairs_gpu = self.device.htod_sync_copy(&flat).unwrap();
-        self.num_pairs = pairs.len();
+        self.stage_pairs(pairs);
     }
     
     pub fn num_sims(&self) -> usize { self.num_sims }
@@ -947,8 +1222,9 @@ impl CudaMultiSimulation {
     pub fn epoch(&self) -> u64 { self.epoch }
     pub fn set_epoch(&mut self, epoch: u64) { self.epoch = epoch; }
 
-    /// Update energy configuration (recomputes energy map on GPU)
-    /// Call this when energy sources change dynamically
+    /// Update energy configuration (recomputes energy map on GPU).
+    /// Call this when energy sources change dynamically. Waits for the current
+    /// compute kernel to finish first so the update is safe.
     pub fn update_energy_config(&mut self, config: &crate::energy::EnergyConfig) {
         let energy_map = compute_energy_map(
             Some(config),
@@ -959,12 +1235,11 @@ impl CudaMultiSimulation {
             self.border_thickness,
         );
 
-        // Upload new energy map to GPU
+        self.wait_for_compute();
         if let Err(e) = self.device.htod_sync_copy_into(&energy_map, &mut self.energy_map_gpu) {
             eprintln!("CUDA energy map update failed: {:?}", e);
         }
 
-        // Update enabled flag
         self.energy_enabled = config.enabled && !config.sources.is_empty();
     }
 }

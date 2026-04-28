@@ -1,0 +1,69 @@
+# Non-Op Spawn Experiment with Buffer Zone (no energy)
+# =====================================================
+# 512x512 grid with a centered 256x256 "active" region. The active center is
+# initialized identically to the previous nonop test run (25% non-op, 75% random).
+# The surrounding buffer (everything outside the 256x256 center) is all non-op,
+# giving programs room to expand into inert territory.
+#
+# Program / non-op counts in the active center match the previous run:
+#   - 65,536 programs in the active region
+#   - ~16,384 (25%) start as non-op
+# Buffer zone: 196,608 additional non-op cells around the active center.
+# Total grid: 262,144 programs.
+
+backend: "cuda"
+
+grid:
+  width: 512
+  height: 512
+
+simulation:
+  seed: 42
+  mutation_rate: 2048
+  steps_per_run: 4096
+  max_epochs: 50000
+  neighbor_range: 2
+  auto_terminate_dead_epochs: 0
+  parallel_sims: 1
+  parallel_layout: [1, 1]
+  border_interaction: false
+  border_thickness: 0
+  nonop_spawn_rate: 0.25
+  init_region_width: 256
+  init_region_height: 256
+
+output:
+  frame_interval: 5
+  frames_dir: "frames_nonop_buffer"
+  frame_format: "png"
+  thumbnail_scale: 2
+  save_raw: true
+  raw_dir: "raw_data_nonop_buffer"
+  async_save: true
+  render_frames: true
+
+checkpoint:
+  enabled: false
+  interval: 10000
+  path: "checkpoints_nonop_buffer"
+  resume_from: ""
+
+energy:
+  enabled: false
+  sources: 0
+  radius: 0
+  reserve_epochs: 0
+  death_epochs: 0
+  spontaneous_rate: 0
+  shape: "circle"
+  dynamic:
+    random_placement: false
+    max_sources: 0
+    source_lifetime: 0
+    spawn_rate: 0
+
+metrics:
+  enabled: true
+  interval: 500
+  output_file: "metrics_nonop_buffer.csv"
+  brotli_quality: 4

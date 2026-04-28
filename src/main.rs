@@ -67,6 +67,20 @@ pub struct SimConfig {
     pub migration_probability: f64,
     /// Thickness of zero-energy "dead zone" between simulations
     pub border_thickness: usize,
+    /// Fraction (0.0..=1.0) of programs that start as "non-op" tapes -
+    /// 64 random bytes drawn only from the 246 non-command byte values.
+    /// These programs are inert at epoch 0 but can still be read/written
+    /// by partners during interaction. 0.0 = standard random init.
+    #[serde(default)]
+    pub nonop_spawn_rate: f32,
+    /// Width of the centered "active" init region (0 = use full grid).
+    /// Cells outside this region are initialized as non-op tapes regardless
+    /// of `nonop_spawn_rate`, creating a non-op buffer zone around the edge.
+    #[serde(default)]
+    pub init_region_width: usize,
+    /// Height of the centered "active" init region (0 = use full grid).
+    #[serde(default)]
+    pub init_region_height: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +216,9 @@ impl Default for SimConfig {
             border_interaction: false, // Disabled by default
             migration_probability: 0.2, // 20% chance to cross border if interaction possible
             border_thickness: 2, // 2-pixel dead zone at borders
+            nonop_spawn_rate: 0.0, // Standard random init by default
+            init_region_width: 0,  // 0 = use full grid
+            init_region_height: 0,
         }
     }
 }
@@ -522,6 +539,10 @@ struct Args {
     border_interaction: bool,
     migration_probability: f64,
     border_thickness: usize,
+    // Initialization options
+    nonop_spawn_rate: f32,
+    init_region_width: usize,
+    init_region_height: usize,
     // Checkpoint options
     checkpoint_enabled: bool,
     checkpoint_interval: usize,
@@ -577,6 +598,9 @@ impl Default for Args {
             border_interaction: false,
             migration_probability: 0.2,
             border_thickness: 2,
+            nonop_spawn_rate: 0.0,
+            init_region_width: 0,
+            init_region_height: 0,
             // Checkpoint defaults
             checkpoint_enabled: false,
             checkpoint_interval: 10000,
@@ -632,6 +656,9 @@ impl From<Config> for Args {
             border_interaction: c.simulation.border_interaction,
             migration_probability: c.simulation.migration_probability,
             border_thickness: c.simulation.border_thickness,
+            nonop_spawn_rate: c.simulation.nonop_spawn_rate,
+            init_region_width: c.simulation.init_region_width,
+            init_region_height: c.simulation.init_region_height,
             checkpoint_enabled: c.checkpoint.enabled,
             checkpoint_interval: c.checkpoint.interval,
             checkpoint_path: c.checkpoint.path,
@@ -1096,7 +1123,7 @@ fn main() {
     // Try CUDA first (no 4GB buffer limit)
     #[cfg(feature = "cuda")]
     {
-        if args.parallel_sims > 1 && cuda::cuda_available() {
+        if args.parallel_sims >= 1 && cuda::cuda_available() {
             println!("\n  Backend: CUDA (no buffer size limit)\n");
             
             match cuda::CudaMultiSimulation::new(
@@ -1110,6 +1137,12 @@ fn main() {
                 gpu_energy_config.as_ref(),
                 per_sim_configs.clone(),
                 args.border_thickness,
+                args.nonop_spawn_rate,
+                if args.init_region_width > 0 && args.init_region_height > 0 {
+                    Some((args.init_region_width, args.init_region_height))
+                } else {
+                    None
+                },
             ) {
                 Ok(mut cuda_sim) => {
                     let [layout_cols, layout_rows] = args.parallel_layout;
@@ -2954,19 +2987,12 @@ fn save_ppm_frame(
 
 /// Initialize byte colors for visualization
 fn init_byte_colors() -> [[u8; 3]; 256] {
-    let mut colors = [[0u8; 3]; 256];
-    
-    for i in 0..256 {
-        // Default: grayscale based on byte value
-        let gray = i as u8;
-        colors[i] = [gray, gray, gray];
-    }
-    
-    // Null byte (dead/empty) - bright red for visibility
-    colors[0] = [255, 0, 0];
-    
-    // BFF commands get distinct colors
-    colors[b'+' as usize] = [255, 100, 100]; // Red
+    // All non-command bytes render as bright red (NOP / inert).
+    // BFF command bytes get distinct highlight colors so live code is visible
+    // against the red non-op background.
+    let mut colors = [[255u8, 0, 0]; 256];
+
+    colors[b'+' as usize] = [255, 100, 100]; // Red (light)
     colors[b'-' as usize] = [100, 100, 255]; // Blue
     colors[b'>' as usize] = [100, 255, 100]; // Green
     colors[b'<' as usize] = [255, 255, 100]; // Yellow
@@ -2976,7 +3002,7 @@ fn init_byte_colors() -> [[u8; 3]; 256] {
     colors[b']' as usize] = [200, 100, 255]; // Purple
     colors[b'.' as usize] = [255, 255, 255]; // White
     colors[b',' as usize] = [200, 200, 200]; // Light gray
-    
+
     colors
 }
 

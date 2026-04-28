@@ -13,6 +13,7 @@ frames_1766911219
 *.ppm
 generated.yaml
 metrics.csv
+metrics*
 # Editor/IDE
 .vscode/
 .idea/
